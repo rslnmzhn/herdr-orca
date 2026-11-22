@@ -132,10 +132,13 @@ export default class Tabs extends View {
     const enabled = [...new Set([...(shared("workspace.panels") ?? ["files", "changes"]), "orca"])];
     this.syncPanel(space, panel, body, enabled);
     const orcaUi = shared("orca.ui");
-    const orcaState = orcaUi?.state;
-    const orcaSpinning = orcaState === "watching" || orcaState === "classifying" || orcaState === "advancing" || orcaState === "fixing_ci";
-    const orcaWaitingCi = orcaState === "waiting_ci";
-    const orcaAlert = orcaState === "paused" || orcaState === "error";
+    const orcaEntries = orcaUi?.sessions && typeof orcaUi.sessions === "object"
+      ? Object.values(orcaUi.sessions)
+      : orcaUi?.state ? [orcaUi] : [];
+    const orcaSpinning = orcaEntries.some(e => e?.state === "watching" || e?.state === "classifying" || e?.state === "advancing" || e?.state === "fixing_ci");
+    const orcaWaitingCi = orcaEntries.some(e => e?.state === "waiting_ci");
+    const orcaAlert = orcaEntries.some(e => e?.state === "paused" || e?.state === "error");
+    const orcaActiveCount = orcaUi?.activeCount ?? orcaEntries.filter(e => e?.state && e.state !== "idle" && e.state !== "paused" && e.state !== "error").length;
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
@@ -157,6 +160,7 @@ export default class Tabs extends View {
         })
         .child(svg("mods/orca/icons/orca.svg").size(14).when(orcaSpinning || orcaWaitingCi, el => el.text_color(t.accent)))
         .child("Orca")
+        .when(orcaActiveCount > 1, el => el.child(div().px(4).h(15).rounded(4).bg(t.accent + "26").text_size(10).font_semibold().text_color(t.accent).flex().items_center().child(String(orcaActiveCount))))
         .when(orcaSpinning, el => el.child(svg("mods/orca/icons/spinner.svg").size(12).flex_none().text_color(t.accent).spin(900)))
         .when(orcaWaitingCi, el => el.child(div().size(6).rounded(3).bg(t.working).loop("opacity", { from: 0.35, to: 1, period: 1100 })))
         .when(orcaAlert, el => el.child(div().size(6).rounded(3).bg(t.blocked)));

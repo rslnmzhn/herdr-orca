@@ -12,3 +12,7 @@ export function resolveCompletedCiAction(ciState) {
   if (ciState === "failure") return "fix_ci";
   return "mark_done";
 }
+
+export function shouldRunAutoCompact(autoCompact, hasNextItem) {
+  return Boolean(autoCompact) && Boolean(hasNextItem);
+}

@@ -6,26 +6,26 @@ A backlog orchestrator layout and mod bundle for Herdr (`layouts/main-orca.json`
 
 ## What you see
 
-- **Left agents sidebar (`mods/agents-orca/`):** identical to shipped `agents`, except when `shared("orca.ui")` is active (`watching`, `classifying`, `waiting_ci`, `fixing_ci`, `advancing`) on an `idle`/`done` agent, it moves into a **`Waiting`** section and shows a pulsing **`Waiting`** badge instead of `Idle`.
-- **Top tab bar (`mods/tabs-orca/`):** identical to shipped `tabs`, with an **Orca** toggle button right after `Changes` showing upright `mods/orca/icons/orca.svg` (plus a spinning `spinner.svg` in `accent` while active, pulsing `working` dot while waiting for CI, `blocked` dot when paused or errored).
+- **Left agents sidebar (`mods/agents-orca/`):** identical to shipped `agents`, except for every agent whose entry in `shared("orca.ui").sessions[address]` is active (`watching`, `classifying`, `waiting_ci`, `fixing_ci`, `advancing`) while `idle`/`done`, it moves into a **`Waiting`** section and shows a pulsing **`Waiting`** badge instead of `Idle`.
+- **Top tab bar (`mods/tabs-orca/`):** identical to shipped `tabs`, with an **Orca** toggle button right after `Changes` showing upright `mods/orca/icons/orca.svg` (plus an active count badge when `activeCount > 1`, a spinning `spinner.svg` in `accent` while any session is active, pulsing `working` dot while waiting for CI, `blocked` dot when paused or errored).
 - **Right-hand Orca panel (`368px` default in `panel-body` stack):**
-  - **Header (`chrome`):** upright Orca icon, animated status badge (`Ожидание`, `Наблюдение`, `Классификация`, `Ожидание CI`, `Фикс CI`, `Следующая задача`, `Пауза`, `Ошибка`), and `Старт` / `Продолжить` / `Пауза` / `Пропустить` / `Стоп` controls.
-  - **Session & backlog bar (`surface`):** live session picker, backlog folder selector, `Авто` / `Ревьювер` classifier mode pills, `Задачи` / `Эпики` queue mode pills, and refresh button.
+  - **Header (`chrome`):** upright Orca icon, animated status badge (`Ожидание`, `Наблюдение`, `Классификация`, `Ожидание CI`, `Фикс CI`, `Следующая задача`, `Пауза`, `Ошибка`), active session count badge when > 1, and `Старт` / `Продолжить` / `Пауза` / `Пропустить` / `Стоп` controls for the viewed agent.
+  - **Session & backlog bar (`surface`):** clickable active-session chips, live session picker across spaces, backlog folder selector, `Авто` / `Ревьювер` classifier mode pills, `Задачи` / `Эпики` queue mode pills, refresh button, and **`Автокомпакт`** checkbox.
   - **Pipeline strip:** 3-stage animated progress (`Агент` → `Классификатор` / `Ревьювер` → `CI / Done`), active task/epic card, last verdict badge, review retry badge (`Ревью X/Y`), CI status row with `MM:SS` countdown, retry counter (`attempt/max` or `attempt/∞`), and `Проверить CI` button.
   - **Queue & activity log:** scrollable upcoming queue items and timestamped event log (side-by-side at `width >= 720`, stacked when narrower).
   - **Bottom footer & settings drawer:** persistent `Настройки` button + mode badge + active model badge, expanding a drawer with `Base URL (/v1)`, masked `API Key` with eye toggle, `Загрузить модели` + model chips, `Попыток фикса CI`, and `Попыток ревью` (`0 = бесконечно, по умолчанию 3`).
 
 ## How it behaves
 
-- **Session binding:** when `idle`, tracks the active space's backlog and auto-selects the focused/first live agent; when running, locks `boundRun` (`spaceId`, `terminal`, `backlogDir`, `projectRoot`, `on`) so switching spaces does not hijack the run.
-- **Start guards & Kanban status sync:** if the selected session is `blocked`, refuses to send and notifies with `playSound("blocked")`; if already `working`, attaches in `watching` mode without sending a duplicate prompt; otherwise marks the item `[-] IN PROGRESS` on disk and dispatches the prompt with explicit `herdr-kanban` status instructions (`[ ] TODO`, `[-] IN PROGRESS`, `[!] BLOCKED`, `[x] DONE`).
+- **Per-agent session isolation:** `Orca` maintains an independent `SessionState` (`sessions.js`) per terminal address (`state`, `boundRun`, `backlogDir`, `projectRoot`, `epics`, `mode`, `currentItem`, `runSeq`, `logs`, CI/review counters), per-directory `watchFolder` pool, and per-file `writeTextFile` lock. Focusing another agent in Herdr or clicking an active-session chip switches the panel view without interrupting other running agents.
+- **Start guards, Auto-compact & Kanban status sync:** if the selected session is `blocked`, refuses to send and notifies with `playSound("blocked")`; if already `working`, attaches in `watching` mode without sending a duplicate prompt; otherwise marks the item `[-] IN PROGRESS` on disk and dispatches the prompt with explicit `herdr-kanban` status instructions (`[ ] TODO`, `[-] IN PROGRESS`, `[!] BLOCKED`, `[x] DONE`). When `Автокомпакт` is enabled, sends `/compact` and waits for completion after each finished task before dispatching the next one.
 - **Turn classification & Reviewer mode:** on `working` → `idle`/`done` (after grace window and 2s debounce), reads `hc read`, `git status --short`, `git log`, `git diff` (in `reviewer` mode), and `gh` CI status, then calls `POST <baseUrl>/chat/completions`. In `reviewer` mode, provides read-only inspection tools (`read_terminal`, `git_status`, `git_diff`, `list_files`, `read_file`) up to 6 rounds (falling back to single-shot diff review if `tools` is rejected) and sends `needs_fix` feedback back to the agent up to `maxReviewRetries`.
 - **CI polling & auto-fix:** on `waiting_ci` (or `completed` with `pending` CI), polls `gh run list` / `gh pr checks` every 5 minutes. On `success`, marks the task/epic `[x] DONE` via `writeTextFile` and sends the next item. On `failure`, fetches `gh run view --log-failed` and sends a fix prompt back to the same session up to `maxCiRetries` (`0` = unlimited, default `3`); when exhausted, stops with `notify` + `playSound("blocked")`.
 
 ## Built from
 
 - **Layout:** `layouts/main-orca.json` (cloned from `main`, using `tabs-orca`, `agents-orca`, and adding `orca` to `panel-body`).
-- **Mods:** `mods/tabs-orca/` (cloned from `tabs`), `mods/agents-orca/` (cloned from `agents`), and `mods/orca/` (`mod.json`, `main.js`, `ui.js`, `parser.js`, `paths.js`, `classifier.js`, `reviewer_tools.js`, `ci.js`, `guards.js`, and 16 monochrome SVGs in `mods/orca/icons/`).
+- **Mods:** `mods/tabs-orca/` (cloned from `tabs`), `mods/agents-orca/` (cloned from `agents`), and `mods/orca/` (`mod.json`, `main.js`, `ui.js`, `parser.js`, `paths.js`, `classifier.js`, `reviewer_tools.js`, `ci.js`, `guards.js`, `sessions.js`, and 16 monochrome SVGs in `mods/orca/icons/`).
 - **Herdr APIs:** `spaces`, `panes`, `focused`, `agents`, `terminals`, `exec`, `hc`, `home`, `readTextFile`, `writeTextFile`, `watchFolder`, `pickFolder`, `run`, `notify`, `playSound`, `theme`, `nextCommand`, `checking`, `window`, `shared`, `setShared`, `settings`, `props`.
 - **External programs & network:** `fetch` to user-configured OpenAI-compatible `/v1/models` and `/v1/chat/completions`; `gh` CLI (`run list`, `pr checks`, `run view --log-failed`); `git`; `powershell`/`sh` for listing `.md` files.
 
@@ -37,6 +37,6 @@ A backlog orchestrator layout and mod bundle for Herdr (`layouts/main-orca.json`
 
 ## Done when
 
-- `bun test` passes all 42 unit tests across `tests/*.test.js`.
+- `bun test` passes all 48 unit tests across `tests/*.test.js`.
 - `herdr-app check` passes on `mods/orca`, `mods/tabs-orca`, and `mods/agents-orca`.
 - Switching to `main-orca` shows the `Orca` button in the top bar and opens the right-hand Orca panel with zero errors in `herdr-app status`.

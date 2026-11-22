@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { resolveStartAction, resolveCompletedCiAction } from "../mods/orca/guards.js";
+import {
+  resolveStartAction,
+  resolveCompletedCiAction,
+  shouldRunAutoCompact,
+} from "../mods/orca/guards.js";
 
 describe("resolveStartAction", () => {
   test("blocks start when selected session is blocked", () => {
@@ -33,5 +37,14 @@ describe("resolveCompletedCiAction", () => {
     expect(resolveCompletedCiAction("error")).toBe("mark_done");
     expect(resolveCompletedCiAction(null)).toBe("mark_done");
     expect(resolveCompletedCiAction(undefined)).toBe("mark_done");
+  });
+});
+
+describe("shouldRunAutoCompact", () => {
+  test("runs /compact only when autoCompact is enabled and a next item exists", () => {
+    expect(shouldRunAutoCompact(true, true)).toBe(true);
+    expect(shouldRunAutoCompact(true, false)).toBe(false);
+    expect(shouldRunAutoCompact(false, true)).toBe(false);
+    expect(shouldRunAutoCompact(undefined, true)).toBe(false);
   });
 });

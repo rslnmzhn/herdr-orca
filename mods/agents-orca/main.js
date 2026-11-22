@@ -64,13 +64,21 @@ const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[
 const SECTION = { 4: "Needs you", 3: "Done", 2: "Working", 1.5: "Waiting", 1: "Idle" };
 const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working", 1.5: "working" };
 const ORCA_ACTIVE_STATES = new Set(["watching", "classifying", "waiting_ci", "fixing_ci", "advancing"]);
-const isOrcaWaiting = (a, orcaUi) =>
-  Boolean(
-    orcaUi?.terminal &&
-    orcaUi.terminal === a.address &&
-    ORCA_ACTIVE_STATES.has(orcaUi.state) &&
+const getAgentOrca = (a, orcaUi) => {
+  if (!orcaUi || !a?.address) return null;
+  if (orcaUi.sessions && typeof orcaUi.sessions === "object") {
+    return orcaUi.sessions[a.address] ?? null;
+  }
+  return orcaUi.terminal === a.address ? orcaUi : null;
+};
+const isOrcaWaiting = (a, orcaUi) => {
+  const entry = getAgentOrca(a, orcaUi);
+  return Boolean(
+    entry &&
+    ORCA_ACTIVE_STATES.has(entry.state) &&
     (a.status === "idle" || a.status === "done"),
   );
+};
 
 function duration(ms) {
   const m = Math.floor(ms / 60000);

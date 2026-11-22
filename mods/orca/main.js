@@ -42,8 +42,18 @@ import {
   shouldRetryCi,
   buildCiFixPrompt,
 } from "./ci.js";
-import { resolveStartAction, resolveCompletedCiAction } from "./guards.js";
+import {
+  resolveStartAction,
+  resolveCompletedCiAction,
+  shouldRunAutoCompact,
+} from "./guards.js";
 import { createReviewerToolExecutor, buildReviewFixPrompt } from "./reviewer_tools.js";
+import {
+  ORCA_ACTIVE_STATES,
+  createSessionState,
+  getOrCreateSession,
+  buildOrcaUiSnapshot,
+} from "./sessions.js";
 import {
   statusMeta,
   renderHeader,
@@ -78,6 +88,7 @@ function normalizeSettings(raw) {
   const maxCiRetries = parseNonNegativeInt(obj.maxCiRetries, 3);
   const maxReviewRetries = parseNonNegativeInt(obj.maxReviewRetries, 3);
   const reviewMode = obj.reviewMode === "auto" ? "auto" : "reviewer";
+  const autoCompact = Boolean(obj.autoCompact);
   const parsedPoll = Number(obj.ciPollMinutes);
   const ciPollMinutes = Number.isFinite(parsedPoll) && parsedPoll > 0 ? parsedPoll : 5;
   return {
@@ -87,6 +98,7 @@ function normalizeSettings(raw) {
     maxCiRetries,
     maxReviewRetries,
     reviewMode,
+    autoCompact,
     ciPollMinutes,
   };
 }
@@ -160,8 +172,12 @@ async function listMarkdownFiles(dir, on) {
       `'${escaped}'`;
     const r = await exec("powershell", ["-NoProfile", "-Command", script], { on });
     if (r.code !== 0) return null;
-    const parsed = JSON.parse(r.stdout || "[]");
-    return Array.isArray(parsed) ? parsed : [parsed];
+    try {
+      const parsed = JSON.parse(r.stdout || "[]");
+      return Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      return null;
+    }
   };
 
   if (!on && window()?.platform === "windows") {
@@ -205,23 +221,8 @@ export default class Orca extends View {
     this.handle = cx.focus_handle();
     this.size = null;
 
-    this.state = "idle";
-    this.pausedFromState = null;
-    this.statusReason = null;
-    this.lastVerdict = null;
-
-    this.epics = [];
-    this.backlogDir = null;
-    this.projectRoot = null;
-    this.overrideFolder = null;
-    this.on = null;
-    this.readOnly = false;
-    this.loading = false;
-    this.contextKey = null;
-    this.activeSpaceId = null;
-
     const savedMode = shared(STORAGE_MODE);
-    this.mode = savedMode === "epics" ? "epics" : "tasks";
+    this.defaultMode = savedMode === "epics" ? "epics" : "tasks";
 
     const savedFolders = shared(STORAGE_FOLDERS);
     this.spaceFolders =
@@ -267,33 +268,19 @@ export default class Orca extends View {
     });
     this.maxReviewRetriesInput.on("submit", (_e, cx) => this.saveSettings(cx));
 
+    this.sessions = new Map();
+    this.fallbackSession = createSessionState(null, { mode: this.defaultMode });
     this.selectedTerminal = null;
+    this.lastFocusedTerminal = null;
     this.sessionPickerOpen = false;
 
-    this.boundRun = null;
-    this.currentItem = null;
-    this.skippedKeys = new Set();
-    this.ciRetryCount = 0;
-    this.reviewRetryCount = 0;
-    this.reviewProgress = null;
-    this.ciInfo = null;
-    this.nextCiCheckAt = null;
-    this.ciChecking = false;
-
-    this.runSeq = 0;
-    this.sendingPrompt = false;
-    this.sentAt = 0;
-    this.sawWorkingSinceSend = false;
-    this.idleSince = null;
-    this.lastAgentStatus = null;
-
-    this.logs = [];
-    this.watchHandle = null;
-    this.watchedDir = null;
-    this._lastPublishedUi = null;
+    this.dirWatches = new Map();
+    this.fileWriteLocks = new Map();
+    this._lastPublishedUiJson = null;
 
     if (checking()) return;
 
+    this.syncSelectedTerminalWithFocus();
     this.publishUiState();
     this.refresh(cx, true);
 
@@ -303,24 +290,25 @@ export default class Orca extends View {
     cx.spawn(async (cx) => {
       for (;;) {
         const cmd = await nextCommand();
+        const session = this.activeSession();
         if (cmd === "focus") {
           this.handle.focus();
         } else if (cmd === "start") {
-          if (this.state === "paused") {
+          if (session.state === "paused") {
             this.resume(cx);
-          } else if (this.state === "idle" || this.state === "error") {
+          } else if (session.state === "idle" || session.state === "error") {
             this.start(cx);
           }
         } else if (cmd === "pause") {
-          if (this.isActiveState()) {
+          if (this.isSessionActive(session)) {
             this.pause(cx);
           }
         } else if (cmd === "stop") {
-          if (this.state !== "idle") {
+          if (session.state !== "idle") {
             this.stop(cx);
           }
         } else if (cmd === "check-ci") {
-          if (this.state === "waiting_ci") {
+          if (session.state === "waiting_ci") {
             this.checkCiNow(cx);
           }
         } else if (cmd === "toggle-settings") {
@@ -332,18 +320,21 @@ export default class Orca extends View {
   }
 
   async close() {
-    this.runSeq++;
-    this.stopWatch();
+    for (const s of this.sessions.values()) {
+      s.runSeq++;
+    }
+    this.stopAllWatches();
   }
 
-  isActiveState() {
-    return (
-      this.state === "watching" ||
-      this.state === "classifying" ||
-      this.state === "waiting_ci" ||
-      this.state === "fixing_ci" ||
-      this.state === "advancing"
-    );
+  activeSession() {
+    if (!this.selectedTerminal) return this.fallbackSession;
+    return getOrCreateSession(this.sessions, this.selectedTerminal, {
+      mode: this.defaultMode,
+    });
+  }
+
+  isSessionActive(session) {
+    return Boolean(session && ORCA_ACTIVE_STATES.has(session.state));
   }
 
   getCiPollMs() {
@@ -351,131 +342,170 @@ export default class Orca extends View {
     return (Number.isFinite(mins) && mins > 0 ? mins : 5) * 60 * 1000;
   }
 
-  addLog(level, text) {
+  addLog(session, level, text) {
+    if (!session) return;
     const entry = {
       time: Date.now(),
       level: level || "info",
       text: String(text ?? ""),
     };
-    this.logs = [entry, ...this.logs].slice(0, MAX_LOGS);
+    session.logs = [entry, ...session.logs].slice(0, MAX_LOGS);
   }
 
   publishUiState() {
     const t = theme();
-    const meta = statusMeta(t, this.state);
-    const spaceId = this.boundRun?.spaceId ?? this.activeSpaceId ?? null;
-    const terminal = this.boundRun?.terminal ?? this.selectedTerminal ?? null;
-    const maxCiRetries = this.settings?.maxCiRetries ?? 3;
-    const reviewMode = this.settings?.reviewMode ?? "reviewer";
-    const next = {
-      state: this.state,
-      label: meta.label,
-      spaceId,
-      terminal,
-      ciRetryCount: this.ciRetryCount,
-      maxCiRetries,
-      reviewMode,
-    };
-    const prev = this._lastPublishedUi;
-    if (
-      prev &&
-      prev.state === next.state &&
-      prev.label === next.label &&
-      prev.spaceId === next.spaceId &&
-      prev.terminal === next.terminal &&
-      prev.ciRetryCount === next.ciRetryCount &&
-      prev.maxCiRetries === next.maxCiRetries &&
-      prev.reviewMode === next.reviewMode
-    ) {
-      return;
-    }
-    this._lastPublishedUi = next;
+    const next = buildOrcaUiSnapshot(
+      this.sessions,
+      this.selectedTerminal,
+      this.settings,
+      (st) => statusMeta(t, st).label,
+    );
+    const serialized = JSON.stringify(next);
+    if (serialized === this._lastPublishedUiJson) return;
+    this._lastPublishedUiJson = serialized;
     setShared(STORAGE_UI, next);
   }
 
-  setState(nextState) {
-    this.state = nextState;
+  setSessionState(session, nextState) {
+    if (!session) return;
+    session.state = nextState;
     this.publishUiState();
   }
 
-  stopWatch() {
-    if (this.watchHandle) {
+  stopAllWatches() {
+    for (const entry of this.dirWatches.values()) {
+      entry.active = false;
       try {
-        this.watchHandle.cancel();
+        entry.handle?.cancel();
       } catch {}
-      this.watchHandle = null;
     }
-    this.watchedDir = null;
+    this.dirWatches.clear();
   }
 
-  startWatch(dir, on, cx) {
-    if (!dir || on) {
-      this.stopWatch();
-      return;
-    }
-    if (this.watchedDir === dir && this.watchHandle) return;
-    this.stopWatch();
-    this.watchedDir = dir;
-    cx.spawn(async (cx) => {
-      while (this.watchedDir === dir) {
-        const watch = watchFolder(dir);
-        this.watchHandle = watch;
-        try {
-          const changed = await watch;
-          if (this.watchedDir !== dir) break;
-          if (Array.isArray(changed) && changed.length === 0) break;
-          this.refresh(cx, false);
-        } catch {
-          if (this.watchedDir === dir) this.watchedDir = null;
-          break;
-        }
+  syncWatches(cx) {
+    const wantedDirs = new Set();
+    for (const s of this.sessions.values()) {
+      if (!s.backlogDir || s.on) continue;
+      if (s.state !== "idle" || s.terminal === this.selectedTerminal) {
+        wantedDirs.add(s.backlogDir);
       }
-    });
+    }
+
+    for (const [dir, entry] of this.dirWatches.entries()) {
+      if (!wantedDirs.has(dir)) {
+        entry.active = false;
+        try {
+          entry.handle?.cancel();
+        } catch {}
+        this.dirWatches.delete(dir);
+      }
+    }
+
+    for (const dir of wantedDirs) {
+      if (this.dirWatches.has(dir)) continue;
+      const entry = { active: true, handle: null };
+      this.dirWatches.set(dir, entry);
+      cx.spawn(async (cx) => {
+        while (entry.active && this.dirWatches.get(dir) === entry) {
+          const watch = watchFolder(dir);
+          entry.handle = watch;
+          try {
+            const changed = await watch;
+            if (!entry.active || this.dirWatches.get(dir) !== entry) break;
+            if (Array.isArray(changed) && changed.length === 0) break;
+            await this.reloadSessionsForDir(dir, null);
+            cx.notify();
+          } catch {
+            if (this.dirWatches.get(dir) === entry) {
+              this.dirWatches.delete(dir);
+            }
+            break;
+          }
+        }
+      });
+    }
   }
 
-  resolveContext() {
+  async reloadSessionsForDir(dir, on) {
+    if (!dir) return;
+    const files = await listMarkdownFiles(dir, on);
+    if (!files) return;
+    const loaded = await this.loadEpicsFromFiles(dir, files, on);
+    for (const s of this.sessions.values()) {
+      const sDir = s.boundRun?.backlogDir ?? s.backlogDir;
+      const sOn = s.boundRun ? s.boundRun.on : s.on;
+      if (sDir === dir && (sOn ?? null) === (on ?? null)) {
+        s.epics = loaded;
+        this.syncCurrentItemWithEpics(s);
+      }
+    }
+  }
+
+  findTerminalMeta(address) {
     const allSpaces = spaces() ?? [];
-    const space = allSpaces.find((s) => s.active) ?? null;
-    const f = focused();
     const allPanes = panes() ?? [];
-    const spaceTabIds = new Set((space?.tabs ?? []).map((t) => t.id));
-    const paneCwd =
-      (f?.pane ? allPanes.find((p) => p.pane === f.pane)?.cwd : null) ||
-      (f?.space === space?.id ? f?.cwd : null) ||
-      (f?.tab && spaceTabIds.has(f.tab)
-        ? allPanes.find((p) => p.tab === f.tab && p.cwd)?.cwd
-        : null) ||
-      allPanes.find((p) => spaceTabIds.has(p.tab) && p.cwd)?.cwd ||
-      space?.folder ||
+    const allAgents = agents() ?? [];
+    const allTerminals = terminals() ?? [];
+
+    const spaceById = new Map(allSpaces.map((s) => [s.id, s]));
+    const spaceByTab = new Map();
+    for (const s of allSpaces) {
+      for (const tab of s.tabs ?? []) {
+        spaceByTab.set(tab.id, s);
+      }
+    }
+
+    const term = address ? allTerminals.find((t) => t.address === address) ?? null : null;
+    const pane = address ? allPanes.find((p) => p.terminal === address) ?? null : null;
+    const agent = address ? allAgents.find((a) => a.address === address) ?? null : null;
+    const space =
+      (agent?.space ? spaceById.get(agent.space) : null) ??
+      (pane?.tab ? spaceByTab.get(pane.tab) : null) ??
+      allSpaces.find((s) => s.active) ??
       null;
+
+    const cwd = pane?.cwd || term?.cwd || space?.folder || null;
     const on = space?.machine ?? null;
+    return { term, pane, agent, space, cwd: normPath(cwd), on };
+  }
+
+  resolveSessionContext(session) {
+    const meta = this.findTerminalMeta(session?.terminal);
+    const space = meta.space;
+    const on = meta.on;
     const spaceKey = space?.id ?? "__global__";
+    const termKey = session?.terminal ? `term:${session.terminal}` : null;
+
     const sharedFolders = shared(STORAGE_FOLDERS);
     if (sharedFolders && typeof sharedFolders === "object" && !Array.isArray(sharedFolders)) {
       this.spaceFolders = sharedFolders;
     }
-    const overrideFolder =
-      this.overrideFolder && this.overrideFolder.spaceKey === spaceKey
-        ? normPath(this.overrideFolder.dir)
-        : null;
+
+    const overrideFolder = session?.overrideFolder ? normPath(session.overrideFolder) : null;
     const propFolder = normPath(props()?.folder);
-    const manualDir = normPath(this.spaceFolders[spaceKey]);
+    const manualDir =
+      (termKey ? normPath(this.spaceFolders[termKey]) : null) ||
+      normPath(this.spaceFolders[spaceKey]);
+
     const key = JSON.stringify([
+      session?.terminal ?? null,
       spaceKey,
       on,
       overrideFolder,
       propFolder,
       manualDir,
-      normPath(paneCwd),
+      meta.cwd,
     ]);
+
     return {
       space,
       spaceKey,
+      termKey,
       on,
       overrideFolder,
       propFolder,
       manualDir,
-      paneCwd: normPath(paneCwd),
+      paneCwd: meta.cwd,
       key,
     };
   }
@@ -561,29 +591,29 @@ export default class Orca extends View {
     return loaded;
   }
 
-  async reloadEpicsForDir(dir, on) {
-    if (!dir) return;
+  async reloadEpicsForSession(session, dir, on) {
+    if (!session || !dir) return;
     const files = await listMarkdownFiles(dir, on);
     if (!files) return;
     const loaded = await this.loadEpicsFromFiles(dir, files, on);
-    this.epics = loaded;
-    this.syncCurrentItemWithEpics();
+    session.epics = loaded;
+    this.syncCurrentItemWithEpics(session);
   }
 
-  syncCurrentItemWithEpics() {
-    if (!this.currentItem) return;
-    const prevEpic = this.currentItem.epic;
-    const prevTask = this.currentItem.task;
-    const freshEpic = this.epics.find((e) => e.filePath === prevEpic?.filePath) ?? null;
+  syncCurrentItemWithEpics(session) {
+    if (!session?.currentItem) return;
+    const prevEpic = session.currentItem.epic;
+    const prevTask = session.currentItem.task;
+    const freshEpic = session.epics.find((e) => e.filePath === prevEpic?.filePath) ?? null;
     if (!freshEpic) {
-      if (this.state === "idle") this.currentItem = null;
+      if (session.state === "idle") session.currentItem = null;
       return;
     }
     if (!prevTask) {
-      if (this.state === "idle" && (freshEpic.status === "done" || freshEpic.status === "blocked")) {
-        this.currentItem = null;
+      if (session.state === "idle" && (freshEpic.status === "done" || freshEpic.status === "blocked")) {
+        session.currentItem = null;
       } else {
-        this.currentItem = { epic: freshEpic, task: null };
+        session.currentItem = { epic: freshEpic, task: null };
       }
       return;
     }
@@ -593,14 +623,14 @@ export default class Orca extends View {
       freshEpic.tasks.find((t) => t.title === prevTask.title) ??
       null;
     if (!freshTask) {
-      if (this.state === "idle") this.currentItem = null;
+      if (session.state === "idle") session.currentItem = null;
       return;
     }
-    if (this.state === "idle" && (freshTask.status === "done" || freshTask.status === "blocked")) {
-      this.currentItem = null;
+    if (session.state === "idle" && (freshTask.status === "done" || freshTask.status === "blocked")) {
+      session.currentItem = null;
       return;
     }
-    this.currentItem = { epic: freshEpic, task: freshTask };
+    session.currentItem = { epic: freshEpic, task: freshTask };
   }
 
   onBacklogTimer(cx) {
@@ -612,67 +642,76 @@ export default class Orca extends View {
   }
 
   refresh(cx, force = false) {
-    if (this.boundRun) {
-      if (this.loading && !force) return;
-      const runDir = this.boundRun.backlogDir;
-      const runOn = this.boundRun.on;
+    this.syncSelectedTerminalWithFocus();
+    const session = this.activeSession();
+    if (!session.terminal) {
+      this.publishUiState();
+      cx.notify();
+      return;
+    }
+    this.refreshSession(session, cx, force);
+  }
+
+  refreshSession(session, cx, force = false) {
+    if (!session || !session.terminal) return;
+
+    if (session.boundRun) {
+      if (session.loading && !force) return;
+      const runDir = session.boundRun.backlogDir;
+      const runOn = session.boundRun.on;
       if (!runDir) return;
-      this.loading = true;
+      session.loading = true;
       cx.spawn(async (cx) => {
         try {
-          await this.reloadEpicsForDir(runDir, runOn);
+          await this.reloadEpicsForSession(session, runDir, runOn);
         } finally {
-          this.loading = false;
+          session.loading = false;
           cx.notify();
         }
       });
       return;
     }
 
-    const ctx = this.resolveContext();
-    const contextChanged = ctx.key !== this.contextKey;
+    const ctx = this.resolveSessionContext(session);
+    const contextChanged = ctx.key !== session.contextKey;
     if (contextChanged) {
-      this.contextKey = ctx.key;
-      this.activeSpaceId = ctx.space?.id ?? null;
-      this.on = ctx.on;
-      this.readOnly = Boolean(ctx.on);
-      this.sessionPickerOpen = false;
-      this.currentItem = null;
-      this.stopWatch();
+      session.contextKey = ctx.key;
+      session.spaceId = ctx.space?.id ?? null;
+      session.on = ctx.on;
+      session.readOnly = Boolean(ctx.on);
+      session.currentItem = null;
     }
-    if (this.loading && !force && !contextChanged) return;
+    if (session.loading && !force && !contextChanged) return;
 
     const expectedKey = ctx.key;
-    this.loading = true;
+    session.loading = true;
     cx.spawn(async (cx) => {
       try {
         const detected = await this.detectBacklogDir(ctx);
-        if (this.boundRun || this.contextKey !== expectedKey) return;
+        if (session.boundRun || session.contextKey !== expectedKey) return;
 
-        this.backlogDir = detected.backlogDir;
-        this.projectRoot = detected.projectRoot;
+        session.backlogDir = detected.backlogDir;
+        session.projectRoot = detected.projectRoot;
 
         if (!detected.backlogDir) {
-          this.epics = [];
-          this.currentItem = null;
-          this.stopWatch();
+          session.epics = [];
+          session.currentItem = null;
         } else {
           const loaded = await this.loadEpicsFromFiles(
             detected.backlogDir,
             detected.files,
             ctx.on,
           );
-          if (this.boundRun || this.contextKey !== expectedKey) return;
-          this.epics = loaded;
-          this.syncCurrentItemWithEpics();
-          this.startWatch(detected.backlogDir, ctx.on, cx);
+          if (session.boundRun || session.contextKey !== expectedKey) return;
+          session.epics = loaded;
+          this.syncCurrentItemWithEpics(session);
         }
 
-        this.ensureSelectedTerminal();
+        this.syncWatches(cx);
         this.publishUiState();
       } finally {
-        if (!this.boundRun && this.contextKey === expectedKey) {
-          this.loading = false;
+        if (!session.boundRun && session.contextKey === expectedKey) {
+          session.loading = false;
         }
         cx.notify();
       }
@@ -685,12 +724,7 @@ export default class Orca extends View {
     const allAgents = agents() ?? [];
     const allTerminals = terminals() ?? [];
     const f = focused();
-
-    const targetSpaceId =
-      this.boundRun?.spaceId ??
-      this.activeSpaceId ??
-      allSpaces.find((s) => s.active)?.id ??
-      null;
+    const activeSpaceId = allSpaces.find((s) => s.active)?.id ?? null;
 
     const spaceById = new Map(allSpaces.map((s) => [s.id, s]));
     const spaceByTab = new Map();
@@ -714,9 +748,8 @@ export default class Orca extends View {
         (pane?.tab ? spaceByTab.get(pane.tab) : null) ??
         null;
 
-      if (targetSpaceId && space?.id !== targetSpaceId) continue;
-
       const isAgent = Boolean(agent || term.program?.agent);
+      const orcaSession = this.sessions.get(term.address) ?? null;
       choices.push({
         address: term.address,
         label:
@@ -731,7 +764,9 @@ export default class Orca extends View {
           term.program?.key ||
           "Terminal",
         status: agent?.status ?? term.status ?? "idle",
+        orcaState: orcaSession?.state ?? "idle",
         isAgent,
+        inActiveSpace: Boolean(activeSpaceId && space?.id === activeSpaceId),
         isFocused: f?.terminal === term.address || Boolean(agent?.focused || pane?.focused),
         spaceName: space?.name ?? "",
         spaceId: space?.id ?? null,
@@ -739,6 +774,10 @@ export default class Orca extends View {
     }
 
     choices.sort((a, b) => {
+      const aActive = a.orcaState !== "idle" ? 1 : 0;
+      const bActive = b.orcaState !== "idle" ? 1 : 0;
+      if (aActive !== bActive) return bActive - aActive;
+      if (a.inActiveSpace !== b.inActiveSpace) return a.inActiveSpace ? -1 : 1;
       if (a.isAgent !== b.isAgent) return a.isAgent ? -1 : 1;
       if (a.isFocused !== b.isFocused) return a.isFocused ? -1 : 1;
       return a.address.localeCompare(b.address);
@@ -747,61 +786,91 @@ export default class Orca extends View {
     return choices;
   }
 
-  ensureSelectedTerminal() {
-    if (this.boundRun) return;
+  getActiveSessions() {
+    const choices = this.getSessionChoices();
+    const choiceByAddr = new Map(choices.map((c) => [c.address, c]));
+    const list = [];
+    for (const s of this.sessions.values()) {
+      if (!s || s.state === "idle") continue;
+      const c = choiceByAddr.get(s.terminal);
+      list.push({
+        terminal: s.terminal,
+        label: c?.label ?? s.terminal,
+        programName: c?.programName ?? s.terminal,
+        state: s.state,
+        isActive: ORCA_ACTIVE_STATES.has(s.state),
+      });
+    }
+    list.sort((a, b) => {
+      if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+      return a.terminal.localeCompare(b.terminal);
+    });
+    return list;
+  }
+
+  syncSelectedTerminalWithFocus() {
+    const f = focused();
+    const focusedTerm = f?.terminal ?? null;
+    if (focusedTerm && focusedTerm !== this.lastFocusedTerminal) {
+      this.lastFocusedTerminal = focusedTerm;
+      if (this.isTerminalLive(focusedTerm)) {
+        this.selectedTerminal = focusedTerm;
+        getOrCreateSession(this.sessions, focusedTerm, { mode: this.defaultMode });
+        return;
+      }
+    }
+
+    if (this.selectedTerminal && this.isTerminalLive(this.selectedTerminal)) {
+      getOrCreateSession(this.sessions, this.selectedTerminal, { mode: this.defaultMode });
+      return;
+    }
+
     const choices = this.getSessionChoices();
     if (choices.length === 0) {
       this.selectedTerminal = null;
       return;
     }
-    if (this.selectedTerminal && choices.some((c) => c.address === this.selectedTerminal)) {
-      return;
-    }
     const preferred =
-      choices.find((c) => c.isAgent && c.isFocused) ??
+      choices.find((c) => c.inActiveSpace && c.isAgent && c.isFocused) ??
+      choices.find((c) => c.inActiveSpace && c.isAgent) ??
+      choices.find((c) => c.inActiveSpace) ??
       choices.find((c) => c.isAgent) ??
-      choices.find((c) => c.isFocused) ??
       choices[0];
     this.selectedTerminal = preferred?.address ?? null;
+    if (this.selectedTerminal) {
+      getOrCreateSession(this.sessions, this.selectedTerminal, { mode: this.defaultMode });
+    }
   }
 
   toggleSessionPicker(cx) {
-    if (this.isActiveState()) {
-      notify({
-        title: "Цикл Orca активен",
-        body: "Поставьте на паузу или остановите цикл перед сменой сессии",
-        level: "warning",
-      });
-      return;
-    }
     this.sessionPickerOpen = !this.sessionPickerOpen;
     cx.notify();
   }
 
   selectTerminal(address, cx) {
-    if (this.isActiveState()) return;
+    if (!address) return;
     this.selectedTerminal = address;
     this.sessionPickerOpen = false;
-    if (this.boundRun) {
-      if (this.state === "paused") {
-        this.boundRun = { ...this.boundRun, terminal: address };
-      } else {
-        this.boundRun = null;
-      }
-    }
+    const session = getOrCreateSession(this.sessions, address, { mode: this.defaultMode });
     this.publishUiState();
+    this.refreshSession(session, cx, true);
     cx.notify();
   }
 
   chooseFolder(cx) {
-    if (this.state !== "idle" && this.state !== "error") {
+    const session = this.activeSession();
+    if (!session.terminal) {
+      notify({ title: "Выберите сессию агента", level: "warning" });
+      return;
+    }
+    if (session.state !== "idle" && session.state !== "error") {
       notify({
-        title: "Остановите Orca перед сменой папки",
+        title: "Остановите Orca для этой сессии перед сменой папки",
         level: "warning",
       });
       return;
     }
-    if (this.on) {
+    if (session.on) {
       notify({
         title: "Удалённая машина",
         body: "Выбор папки через диалог доступен только на локальной машине",
@@ -826,26 +895,31 @@ export default class Orca extends View {
         }
       }
 
-      const ctx = this.resolveContext();
-      this.overrideFolder = { spaceKey: ctx.spaceKey, dir: targetDir };
+      const ctx = this.resolveSessionContext(session);
+      session.overrideFolder = targetDir;
       const sharedCurrent = shared(STORAGE_FOLDERS);
       const base =
         sharedCurrent && typeof sharedCurrent === "object" && !Array.isArray(sharedCurrent)
           ? sharedCurrent
           : this.spaceFolders;
-      this.spaceFolders = { ...base, [ctx.spaceKey]: targetDir };
+      const nextFolders = { ...base };
+      if (ctx.termKey) nextFolders[ctx.termKey] = targetDir;
+      nextFolders[ctx.spaceKey] = targetDir;
+      this.spaceFolders = nextFolders;
       setShared(STORAGE_FOLDERS, this.spaceFolders);
-      this.refresh(cx, true);
+      this.refreshSession(session, cx, true);
     });
   }
 
   setMode(mode, cx) {
     const nextMode = mode === "epics" ? "epics" : "tasks";
-    if (this.mode === nextMode) return;
-    this.mode = nextMode;
+    const session = this.activeSession();
+    this.defaultMode = nextMode;
     setShared(STORAGE_MODE, nextMode);
-    if (this.state === "idle") {
-      this.currentItem = null;
+    if (session.mode === nextMode) return;
+    session.mode = nextMode;
+    if (session.state === "idle") {
+      session.currentItem = null;
     }
     cx.notify();
   }
@@ -857,6 +931,7 @@ export default class Orca extends View {
     setShared(STORAGE_SETTINGS, this.settings);
     this.publishUiState();
     this.addLog(
+      this.activeSession(),
       "info",
       nextMode === "reviewer"
         ? "Включён режим Ревьювер (проверка кода, diff и тестов)"
@@ -865,27 +940,42 @@ export default class Orca extends View {
     cx.notify();
   }
 
-  getQueueItems() {
-    return listQueueItems(this.epics, this.mode);
+  toggleAutoCompact(cx) {
+    const next = !this.settings.autoCompact;
+    this.settings = { ...this.settings, autoCompact: next };
+    setShared(STORAGE_SETTINGS, this.settings);
+    this.addLog(
+      this.activeSession(),
+      "info",
+      next
+        ? "Автокомпакт включён (/compact перед каждой новой задачей)"
+        : "Автокомпакт выключен",
+    );
+    cx.notify();
   }
 
-  pickNextAvailableItem() {
-    const items = this.getQueueItems();
+  getQueueItems(session = this.activeSession()) {
+    return listQueueItems(session?.epics ?? [], session?.mode ?? this.defaultMode);
+  }
+
+  pickNextAvailableItem(session) {
+    const items = this.getQueueItems(session);
     for (const item of items) {
       const key = queueItemKey(item);
-      if (key && !this.skippedKeys.has(key)) {
+      if (key && !session.skippedKeys.has(key)) {
         return item;
       }
     }
-    return pickNextQueueItem(this.epics, this.mode);
+    return pickNextQueueItem(session.epics, session.mode);
   }
 
   focusQueueItem(item, cx) {
     if (!item) return;
-    if (this.state === "idle" || this.state === "paused" || this.state === "error") {
-      this.currentItem = item;
+    const session = this.activeSession();
+    if (session.state === "idle" || session.state === "paused" || session.state === "error") {
+      session.currentItem = item;
       const label = item.task ? `${item.epic.id} · ${item.task.id}` : item.epic.id;
-      this.addLog("info", `Выбрана задача: ${label}`);
+      this.addLog(session, "info", `Выбрана задача: ${label}`);
       cx.notify();
     } else {
       notify({
@@ -1045,20 +1135,22 @@ export default class Orca extends View {
     return Boolean(term && term.state === "live");
   }
 
-  failRun(reason, cx) {
-    this.runSeq++;
-    this.sendingPrompt = false;
-    this.idleSince = null;
-    this.nextCiCheckAt = null;
-    this.statusReason = reason;
-    this.setState("error");
-    this.addLog("error", reason);
+  failRun(session, reason, cx) {
+    if (!session) return;
+    session.runSeq++;
+    session.sendingPrompt = false;
+    session.idleSince = null;
+    session.nextCiCheckAt = null;
+    session.reviewProgress = null;
+    session.statusReason = reason;
+    this.setSessionState(session, "error");
+    this.addLog(session, "error", reason);
     notify({
-      title: "Orca: ошибка",
+      title: `Orca (${session.terminal}): ошибка`,
       body: reason,
       level: "error",
-      ...(this.boundRun?.terminal
-        ? { action: { name: "pane.focus", args: { terminal: this.boundRun.terminal } } }
+      ...(session.terminal
+        ? { action: { name: "pane.focus", args: { terminal: session.terminal } } }
         : {}),
     });
     playSound("blocked");
@@ -1066,38 +1158,39 @@ export default class Orca extends View {
   }
 
   start(cx) {
-    if (this.isActiveState()) return;
-    this.boundRun = null;
-    this.sendingPrompt = false;
+    this.syncSelectedTerminalWithFocus();
+    const session = this.activeSession();
+    if (!session.terminal || !this.isTerminalLive(session.terminal)) {
+      session.statusReason = "Выберите живую сессию агента";
+      notify({
+        title: "Сессия не выбрана",
+        body: session.statusReason,
+        level: "warning",
+      });
+      cx.notify();
+      return;
+    }
+    if (this.isSessionActive(session)) return;
+
+    session.boundRun = null;
+    session.sendingPrompt = false;
 
     const baseUrl = normalizeBaseUrl(this.settings?.baseUrl);
     const model = this.settings?.model?.trim();
     if (!baseUrl || !model) {
       this.settingsOpen = true;
-      this.statusReason = "Укажите Base URL и модель классификатора в настройках";
+      session.statusReason = "Укажите Base URL и модель классификатора в настройках";
       notify({
         title: "Настройте классификатор",
-        body: this.statusReason,
+        body: session.statusReason,
         level: "warning",
       });
       cx.notify();
       return;
     }
 
-    this.ensureSelectedTerminal();
-    if (!this.selectedTerminal || !this.isTerminalLive(this.selectedTerminal)) {
-      this.statusReason = "Выберите живую сессию агента в активном space";
-      notify({
-        title: "Сессия не выбрана",
-        body: this.statusReason,
-        level: "warning",
-      });
-      cx.notify();
-      return;
-    }
-
-    if (!this.backlogDir) {
-      this.statusReason = "Папка backlog не найдена";
+    if (!session.backlogDir) {
+      session.statusReason = "Папка backlog не найдена";
       notify({
         title: "Бэклог не найден",
         body: "Выберите папку backlog перед запуском",
@@ -1107,8 +1200,8 @@ export default class Orca extends View {
       return;
     }
 
-    if (this.readOnly) {
-      this.statusReason = "Удалённый бэклог в режиме только чтения";
+    if (session.readOnly) {
+      session.statusReason = "Удалённый бэклог в режиме только чтения";
       notify({
         title: "Только чтение",
         body: "Запись статусов на удалённую машину не поддерживается",
@@ -1118,162 +1211,164 @@ export default class Orca extends View {
       return;
     }
 
-    this.skippedKeys.clear();
-    const queue = this.getQueueItems();
+    session.skippedKeys.clear();
+    const queue = this.getQueueItems(session);
     const chosen =
-      this.currentItem && queue.some((q) => queueItemKey(q) === queueItemKey(this.currentItem))
-        ? this.currentItem
-        : this.pickNextAvailableItem();
+      session.currentItem && queue.some((q) => queueItemKey(q) === queueItemKey(session.currentItem))
+        ? session.currentItem
+        : this.pickNextAvailableItem(session);
 
     if (!chosen) {
-      this.completeBacklog(cx);
+      this.completeBacklog(session, cx);
       return;
     }
 
-    const agentStatus = this.readTerminalAgentStatus(this.selectedTerminal);
+    const agentStatus = this.readTerminalAgentStatus(session.terminal);
     const startAction = resolveStartAction(agentStatus);
     if (startAction === "block") {
-      this.statusReason = "Агент в выбранной сессии ожидает ответа пользователя (blocked)";
-      this.addLog("warn", this.statusReason);
+      session.statusReason = "Агент в выбранной сессии ожидает ответа пользователя (blocked)";
+      this.addLog(session, "warn", session.statusReason);
       notify({
-        title: "Orca: требуется внимание",
-        body: this.statusReason,
+        title: `Orca (${session.terminal}): требуется внимание`,
+        body: session.statusReason,
         level: "warning",
-        action: { name: "pane.focus", args: { terminal: this.selectedTerminal } },
+        action: { name: "pane.focus", args: { terminal: session.terminal } },
       });
       playSound("blocked");
       cx.notify();
       return;
     }
 
-    const space =
-      (spaces() ?? []).find((s) => s.id === this.activeSpaceId) ??
-      (spaces() ?? []).find((s) => s.active) ??
-      null;
-
-    this.boundRun = {
-      spaceId: space?.id ?? null,
-      terminal: this.selectedTerminal,
-      backlogDir: this.backlogDir,
-      projectRoot: this.projectRoot || parentDir(this.backlogDir) || space?.folder || null,
-      on: this.on ?? null,
+    const meta = this.findTerminalMeta(session.terminal);
+    session.boundRun = {
+      spaceId: meta.space?.id ?? session.spaceId ?? null,
+      terminal: session.terminal,
+      backlogDir: session.backlogDir,
+      projectRoot: session.projectRoot || parentDir(session.backlogDir) || meta.space?.folder || null,
+      on: session.on ?? null,
     };
-    this.currentItem = chosen;
-    this.ciRetryCount = 0;
-    this.reviewRetryCount = 0;
-    this.reviewProgress = null;
-    this.ciInfo = null;
-    this.nextCiCheckAt = null;
-    this.lastVerdict = null;
-    this.statusReason = null;
-    this.pausedFromState = null;
+    session.currentItem = chosen;
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.lastVerdict = null;
+    session.statusReason = null;
+    session.pausedFromState = null;
     this.sessionPickerOpen = false;
+    this.syncWatches(cx);
 
     if (startAction === "attach") {
-      this.sentAt = Date.now();
-      this.sawWorkingSinceSend = true;
-      this.lastAgentStatus = "working";
-      this.idleSince = null;
-      this.setState("watching");
+      session.sentAt = Date.now();
+      session.sawWorkingSinceSend = true;
+      session.lastAgentStatus = "working";
+      session.idleSince = null;
+      this.setSessionState(session, "watching");
       this.addLog(
+        session,
         "info",
-        `Подключено к активной сессии ${this.selectedTerminal} (ожидание завершения хода)`,
+        `Подключено к активной сессии ${session.terminal} (ожидание завершения хода)`,
       );
       cx.notify();
       return;
     }
 
-    this.dispatchCurrentItem(cx);
+    this.dispatchCurrentItem(session, cx);
   }
 
-  dispatchCurrentItem(cx) {
-    const runCtx = this.boundRun;
-    const item = this.currentItem;
+  dispatchCurrentItem(session, cx) {
+    const runCtx = session?.boundRun;
+    const item = session?.currentItem;
     if (!runCtx || !item) return;
 
-    const seq = ++this.runSeq;
+    const seq = ++session.runSeq;
     const label = item.task ? `${item.epic.id} · ${item.task.id}` : item.epic.id;
     const prompt = buildAgentPrompt(item.epic, item.task, runCtx.projectRoot);
 
-    this.sendingPrompt = true;
-    this.setState("advancing");
-    this.statusReason = null;
+    session.sendingPrompt = true;
+    this.setSessionState(session, "advancing");
+    session.statusReason = null;
     cx.notify();
 
     cx.spawn(async (cx) => {
       try {
         await this.markItemStatusOnDisk(item, "in_progress", runCtx.on).catch(() => {});
-        await this.reloadEpicsForDir(runCtx.backlogDir, runCtx.on).catch(() => {});
-        if (this.runSeq !== seq) return;
+        await this.reloadEpicsForSession(session, runCtx.backlogDir, runCtx.on).catch(() => {});
+        if (session.runSeq !== seq) return;
 
         const res = await hc(["send", runCtx.terminal, prompt]).catch((e) => ({
           code: 1,
           stderr: String(e),
         }));
-        if (this.runSeq !== seq) return;
+        if (session.runSeq !== seq) return;
 
         if (res.code !== 0) {
           this.failRun(
+            session,
             `Не удалось отправить задачу в ${runCtx.terminal}: ${res.stderr || "ошибка hc send"}`,
             cx,
           );
           return;
         }
 
-        this.sentAt = Date.now();
-        this.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
-        this.sawWorkingSinceSend = this.lastAgentStatus === "working";
-        this.idleSince = null;
-        this.setState("watching");
-        this.addLog("info", `Запущена задача ${label} в ${runCtx.terminal}`);
+        session.sentAt = Date.now();
+        session.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
+        session.sawWorkingSinceSend = session.lastAgentStatus === "working";
+        session.idleSince = null;
+        this.setSessionState(session, "watching");
+        this.addLog(session, "info", `Запущена задача ${label} в ${runCtx.terminal}`);
         cx.notify();
       } finally {
-        if (this.runSeq === seq) {
-          this.sendingPrompt = false;
+        if (session.runSeq === seq) {
+          session.sendingPrompt = false;
         }
       }
     });
   }
 
   pause(cx) {
-    if (!this.isActiveState()) return;
-    this.pausedFromState = this.state;
-    this.runSeq++;
-    this.sendingPrompt = false;
-    this.idleSince = null;
-    this.nextCiCheckAt = null;
-    this.setState("paused");
-    this.statusReason = "Цикл поставлен на паузу";
-    this.addLog("warn", "Цикл поставлен на паузу");
+    const session = this.activeSession();
+    if (!this.isSessionActive(session)) return;
+    session.pausedFromState = session.state;
+    session.runSeq++;
+    session.sendingPrompt = false;
+    session.idleSince = null;
+    session.nextCiCheckAt = null;
+    session.reviewProgress = null;
+    this.setSessionState(session, "paused");
+    session.statusReason = "Цикл поставлен на паузу";
+    this.addLog(session, "warn", "Цикл поставлен на паузу");
     cx.notify();
   }
 
   resume(cx) {
-    if (this.state !== "paused") return;
-    if (!this.boundRun || !this.isTerminalLive(this.boundRun.terminal)) {
-      this.failRun("Целевой терминал больше не активен", cx);
+    const session = this.activeSession();
+    if (session.state !== "paused") return;
+    if (!session.boundRun || !this.isTerminalLive(session.boundRun.terminal)) {
+      this.failRun(session, "Целевой терминал больше не активен", cx);
       return;
     }
 
-    this.runSeq++;
-    this.statusReason = null;
-    this.idleSince = null;
+    session.runSeq++;
+    session.statusReason = null;
+    session.idleSince = null;
 
-    if (this.pausedFromState === "waiting_ci") {
-      this.pausedFromState = null;
-      this.setState("waiting_ci");
-      this.addLog("info", "Возобновлено ожидание CI");
-      this.runCiCheck(cx);
+    if (session.pausedFromState === "waiting_ci") {
+      session.pausedFromState = null;
+      this.setSessionState(session, "waiting_ci");
+      this.addLog(session, "info", "Возобновлено ожидание CI");
+      this.runCiCheck(session, cx);
       return;
     }
 
-    this.pausedFromState = null;
-    if (this.currentItem) {
-      this.sentAt = Date.now();
-      this.lastAgentStatus = this.readTerminalAgentStatus(this.boundRun.terminal);
-      this.sawWorkingSinceSend = this.lastAgentStatus === "working";
-      this.setState("watching");
-      this.addLog("info", "Наблюдение возобновлено");
+    session.pausedFromState = null;
+    if (session.currentItem) {
+      session.sentAt = Date.now();
+      session.lastAgentStatus = this.readTerminalAgentStatus(session.boundRun.terminal);
+      session.sawWorkingSinceSend = session.lastAgentStatus === "working";
+      this.setSessionState(session, "watching");
+      this.addLog(session, "info", "Наблюдение возобновлено");
       cx.notify();
     } else {
       this.start(cx);
@@ -1281,144 +1376,167 @@ export default class Orca extends View {
   }
 
   stop(cx) {
-    this.runSeq++;
-    this.sendingPrompt = false;
-    this.boundRun = null;
-    this.currentItem = null;
-    this.skippedKeys.clear();
-    this.ciRetryCount = 0;
-    this.reviewRetryCount = 0;
-    this.reviewProgress = null;
-    this.ciInfo = null;
-    this.nextCiCheckAt = null;
-    this.lastVerdict = null;
-    this.statusReason = null;
-    this.pausedFromState = null;
-    this.sentAt = 0;
-    this.sawWorkingSinceSend = false;
-    this.idleSince = null;
-    this.lastAgentStatus = null;
-    this.setState("idle");
-    this.addLog("info", "Цикл остановлен");
-    this.refresh(cx, true);
+    const session = this.activeSession();
+    if (!session.terminal) return;
+    session.runSeq++;
+    session.sendingPrompt = false;
+    session.boundRun = null;
+    session.currentItem = null;
+    session.skippedKeys.clear();
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.lastVerdict = null;
+    session.statusReason = null;
+    session.pausedFromState = null;
+    session.sentAt = 0;
+    session.sawWorkingSinceSend = false;
+    session.idleSince = null;
+    session.lastAgentStatus = null;
+    this.setSessionState(session, "idle");
+    this.addLog(session, "info", "Цикл остановлен");
+    this.syncWatches(cx);
+    this.refreshSession(session, cx, true);
     cx.notify();
   }
 
   skipCurrent(cx) {
-    if (!this.boundRun || !this.currentItem) return;
-    const key = queueItemKey(this.currentItem);
-    if (key) this.skippedKeys.add(key);
+    const session = this.activeSession();
+    if (!session.boundRun || !session.currentItem) return;
+    const key = queueItemKey(session.currentItem);
+    if (key) session.skippedKeys.add(key);
 
-    const label = this.currentItem.task
-      ? `${this.currentItem.epic.id} · ${this.currentItem.task.id}`
-      : this.currentItem.epic.id;
-    this.addLog("warn", `Пропущена задача ${label}`);
+    const label = session.currentItem.task
+      ? `${session.currentItem.epic.id} · ${session.currentItem.task.id}`
+      : session.currentItem.epic.id;
+    this.addLog(session, "warn", `Пропущена задача ${label}`);
 
-    this.ciRetryCount = 0;
-    this.reviewRetryCount = 0;
-    this.reviewProgress = null;
-    this.ciInfo = null;
-    this.nextCiCheckAt = null;
-    this.lastVerdict = null;
-    this.statusReason = null;
-    this.pausedFromState = null;
-    this.idleSince = null;
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.lastVerdict = null;
+    session.statusReason = null;
+    session.pausedFromState = null;
+    session.idleSince = null;
 
-    const items = this.getQueueItems();
+    const items = this.getQueueItems(session);
     const hasUnskipped = items.some((item) => {
       const k = queueItemKey(item);
-      return k && !this.skippedKeys.has(k);
+      return k && !session.skippedKeys.has(k);
     });
     if (!hasUnskipped && items.length > 1) {
-      this.skippedKeys.clear();
-      if (key) this.skippedKeys.add(key);
+      session.skippedKeys.clear();
+      if (key) session.skippedKeys.add(key);
     }
 
-    const next = this.pickNextAvailableItem();
+    const next = this.pickNextAvailableItem(session);
     if (!next) {
-      this.completeBacklog(cx);
+      this.completeBacklog(session, cx);
       return;
     }
-    this.currentItem = next;
-    this.dispatchCurrentItem(cx);
+    session.currentItem = next;
+    this.dispatchCurrentItem(session, cx);
   }
 
   onTick(cx) {
-    if (this.state === "waiting_ci") {
-      if (this.nextCiCheckAt && Date.now() >= this.nextCiCheckAt && !this.ciChecking) {
-        this.runCiCheck(cx);
-      } else {
-        cx.notify();
+    let shouldNotify = false;
+
+    for (const [addr, session] of [...this.sessions.entries()]) {
+      if (
+        session.state === "idle" &&
+        addr !== this.selectedTerminal &&
+        session.logs.length === 0 &&
+        !this.isTerminalLive(addr)
+      ) {
+        this.sessions.delete(addr);
+        continue;
       }
-      return;
+
+      if (session.state === "waiting_ci") {
+        if (session.nextCiCheckAt && Date.now() >= session.nextCiCheckAt && !session.ciChecking) {
+          this.runCiCheck(session, cx);
+        } else if (addr === this.selectedTerminal) {
+          shouldNotify = true;
+        }
+        continue;
+      }
+
+      if (session.state !== "watching" && session.state !== "fixing_ci") {
+        continue;
+      }
+      if (session.sendingPrompt) {
+        continue;
+      }
+
+      const terminal = session.boundRun?.terminal ?? session.terminal;
+      if (!terminal || !this.isTerminalLive(terminal)) {
+        this.failRun(session, `Терминал ${terminal ?? ""} завершился или недоступен`, cx);
+        continue;
+      }
+
+      const status = this.readTerminalAgentStatus(terminal);
+      if (status === "blocked") {
+        session.pausedFromState = session.state;
+        session.runSeq++;
+        session.idleSince = null;
+        this.setSessionState(session, "paused");
+        session.statusReason = "Агент ожидает ответа пользователя (blocked)";
+        this.addLog(session, "warn", session.statusReason);
+        notify({
+          title: `Orca (${terminal}): требуется внимание`,
+          body: session.statusReason,
+          level: "warning",
+          action: { name: "pane.focus", args: { terminal } },
+        });
+        playSound("blocked");
+        shouldNotify = true;
+        continue;
+      }
+
+      if (status === "working") {
+        session.sawWorkingSinceSend = true;
+        session.idleSince = null;
+        session.lastAgentStatus = "working";
+        continue;
+      }
+
+      const elapsedSinceSend = Date.now() - (session.sentAt || 0);
+      if (!session.sawWorkingSinceSend && elapsedSinceSend < SENT_GRACE_MS) {
+        continue;
+      }
+
+      if (status === "idle" || status === "done") {
+        if (!session.idleSince) {
+          session.idleSince = Date.now();
+        } else if (Date.now() - session.idleSince >= IDLE_DEBOUNCE_MS) {
+          session.idleSince = null;
+          session.lastAgentStatus = status;
+          this.classifyCurrentTurn(session, cx);
+        }
+      }
     }
 
-    if (this.state !== "watching" && this.state !== "fixing_ci") {
-      return;
-    }
-    if (this.sendingPrompt) {
-      return;
-    }
-
-    const terminal = this.boundRun?.terminal;
-    if (!terminal || !this.isTerminalLive(terminal)) {
-      this.failRun(`Терминал ${terminal ?? ""} завершился или недоступен`, cx);
-      return;
-    }
-
-    const status = this.readTerminalAgentStatus(terminal);
-    if (status === "blocked") {
-      this.pausedFromState = this.state;
-      this.runSeq++;
-      this.idleSince = null;
-      this.setState("paused");
-      this.statusReason = "Агент ожидает ответа пользователя (blocked)";
-      this.addLog("warn", this.statusReason);
-      notify({
-        title: "Orca: требуется внимание",
-        body: this.statusReason,
-        level: "warning",
-        action: { name: "pane.focus", args: { terminal } },
-      });
-      playSound("blocked");
+    if (shouldNotify) {
       cx.notify();
-      return;
-    }
-
-    if (status === "working") {
-      this.sawWorkingSinceSend = true;
-      this.idleSince = null;
-      this.lastAgentStatus = "working";
-      return;
-    }
-
-    const elapsedSinceSend = Date.now() - (this.sentAt || 0);
-    if (!this.sawWorkingSinceSend && elapsedSinceSend < SENT_GRACE_MS) {
-      return;
-    }
-
-    if (status === "idle" || status === "done") {
-      if (!this.idleSince) {
-        this.idleSince = Date.now();
-      } else if (Date.now() - this.idleSince >= IDLE_DEBOUNCE_MS) {
-        this.idleSince = null;
-        this.lastAgentStatus = status;
-        this.classifyCurrentTurn(cx);
-      }
     }
   }
 
-  classifyCurrentTurn(cx) {
-    const runCtx = this.boundRun;
-    const item = this.currentItem;
+  classifyCurrentTurn(session, cx) {
+    const runCtx = session?.boundRun;
+    const item = session?.currentItem;
     if (!runCtx || !item) return;
 
     const isReviewer = (this.settings?.reviewMode ?? "reviewer") === "reviewer";
-    const seq = ++this.runSeq;
-    this.reviewProgress = isReviewer ? "Сбор фактов…" : null;
-    this.setState("classifying");
-    this.statusReason = null;
+    const seq = ++session.runSeq;
+    session.reviewProgress = isReviewer ? "Сбор фактов…" : null;
+    this.setSessionState(session, "classifying");
+    session.statusReason = null;
     this.addLog(
+      session,
       "info",
       isReviewer
         ? "Ревьювер проверяет работу агента…"
@@ -1438,7 +1556,7 @@ export default class Orca extends View {
           stdout: "",
           stderr: String(e),
         }));
-        if (this.runSeq !== seq) return;
+        if (session.runSeq !== seq) return;
         const terminalTail = readRes?.stdout ?? "";
 
         let gitStatus = "";
@@ -1455,7 +1573,7 @@ export default class Orca extends View {
               on: runCtx.on,
             }).catch(() => null),
           ]);
-          if (this.runSeq !== seq) return;
+          if (session.runSeq !== seq) return;
           if (stRes?.code === 0) gitStatus = stRes.stdout.trim();
           if (logRes?.code === 0) gitLog = logRes.stdout.trim();
 
@@ -1466,7 +1584,7 @@ export default class Orca extends View {
                 () => null,
               ),
             ]);
-            if (this.runSeq !== seq) return;
+            if (session.runSeq !== seq) return;
             const diffParts = [];
             if (unstagedRes?.code === 0 && unstagedRes.stdout?.trim()) {
               diffParts.push(unstagedRes.stdout.trim());
@@ -1481,7 +1599,7 @@ export default class Orca extends View {
                 cwd: runCtx.projectRoot,
                 on: runCtx.on,
               }).catch(() => null);
-              if (this.runSeq !== seq) return;
+              if (session.runSeq !== seq) return;
               if (showRes?.code === 0) gitDiff = showRes.stdout.trim();
             }
           }
@@ -1496,13 +1614,13 @@ export default class Orca extends View {
         };
         if (runCtx.projectRoot) {
           ci = await checkGithubCiStatus(runCtx.projectRoot, runCtx.on, exec);
-          if (this.runSeq !== seq) return;
+          if (session.runSeq !== seq) return;
         }
 
         const ciSummary =
           ci.state !== "none" && ci.state !== "error" ? ci.summary : "";
         if (ci.state !== "none" && ci.state !== "error") {
-          this.ciInfo = ci;
+          session.ciInfo = ci;
         }
 
         const toolExecutor = isReviewer
@@ -1519,9 +1637,9 @@ export default class Orca extends View {
 
         const onProgress = isReviewer
           ? (stepText) => {
-              if (this.runSeq !== seq) return;
-              this.reviewProgress = stepText;
-              this.addLog("info", `Ревьювер: ${stepText}`);
+              if (session.runSeq !== seq) return;
+              session.reviewProgress = stepText;
+              this.addLog(session, "info", `Ревьювер: ${stepText}`);
               cx.notify();
             }
           : null;
@@ -1542,38 +1660,38 @@ export default class Orca extends View {
           toolExecutor,
           onProgress,
         );
-        if (this.runSeq !== seq) return;
+        if (session.runSeq !== seq) return;
 
-        this.reviewProgress = null;
-        this.lastVerdict = verdict;
-        this.addLog("info", `Вердикт: ${verdict.verdict} — ${verdict.reason}`);
+        session.reviewProgress = null;
+        session.lastVerdict = verdict;
+        this.addLog(session, "info", `Вердикт: ${verdict.verdict} — ${verdict.reason}`);
         if (Array.isArray(verdict.evidence) && verdict.evidence.length > 0) {
-          this.addLog("info", `Факты: ${verdict.evidence.slice(0, 3).join(" | ")}`);
+          this.addLog(session, "info", `Факты: ${verdict.evidence.slice(0, 3).join(" | ")}`);
         }
 
         if (verdict.verdict === "completed") {
           const ciAction = resolveCompletedCiAction(ci.state);
           if (ciAction === "wait_ci") {
-            this.ciInfo = ci;
-            this.enterWaitingCi(ci.summary || "CI ещё выполняется — ожидание завершения", cx);
+            session.ciInfo = ci;
+            this.enterWaitingCi(session, ci.summary || "CI ещё выполняется — ожидание завершения", cx);
             return;
           }
           if (ciAction === "fix_ci") {
-            this.ciInfo = ci;
-            await this.handleCiFailure(runCtx, item, ci, seq, cx);
+            session.ciInfo = ci;
+            await this.handleCiFailure(session, runCtx, item, ci, seq, cx);
             return;
           }
-          await this.markDoneAndAdvance(seq, cx);
+          await this.markDoneAndAdvance(session, seq, cx);
           return;
         }
 
         if (verdict.verdict === "needs_fix") {
-          await this.handleReviewFailure(runCtx, item, verdict, seq, cx);
+          await this.handleReviewFailure(session, runCtx, item, verdict, seq, cx);
           return;
         }
 
         if (verdict.verdict === "waiting_ci") {
-          this.ciInfo =
+          session.ciInfo =
             ci.state !== "none"
               ? ci
               : {
@@ -1581,52 +1699,53 @@ export default class Orca extends View {
                   summary: verdict.reason || "Ожидание CI",
                   branch: ci.branch ?? null,
                 };
-          this.enterWaitingCi(verdict.reason || "Ожидание завершения CI", cx);
+          this.enterWaitingCi(session, verdict.reason || "Ожидание завершения CI", cx);
           return;
         }
 
-        this.pausedFromState = "watching";
-        this.setState("paused");
-        this.statusReason =
+        session.pausedFromState = "watching";
+        this.setSessionState(session, "paused");
+        session.statusReason =
           verdict.reason ||
           (verdict.verdict === "failed"
             ? "Агент завершился с ошибкой"
             : "Требуется участие пользователя");
-        this.addLog(verdict.verdict === "failed" ? "error" : "warn", this.statusReason);
+        this.addLog(session, verdict.verdict === "failed" ? "error" : "warn", session.statusReason);
         notify({
           title:
             verdict.verdict === "failed"
-              ? "Orca: ошибка агента"
-              : "Orca: требуется ответ",
-          body: this.statusReason,
+              ? `Orca (${runCtx.terminal}): ошибка агента`
+              : `Orca (${runCtx.terminal}): требуется ответ`,
+          body: session.statusReason,
           level: verdict.verdict === "failed" ? "error" : "warning",
           action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
         });
         playSound("blocked");
         cx.notify();
       } catch (err) {
-        if (this.runSeq !== seq) return;
-        this.reviewProgress = null;
+        if (session.runSeq !== seq) return;
+        session.reviewProgress = null;
         const msg = String(err?.message ?? err);
-        this.failRun(`Ошибка классификации: ${msg}`, cx);
+        this.failRun(session, `Ошибка классификации: ${msg}`, cx);
       }
     });
   }
 
-  async handleReviewFailure(runCtx, item, verdict, seq, cx) {
+  async handleReviewFailure(session, runCtx, item, verdict, seq, cx) {
     const maxRetries = this.settings?.maxReviewRetries ?? 3;
     const issues = Array.isArray(verdict?.issues) ? verdict.issues.filter(Boolean) : [];
     const summary = issues[0] || verdict?.reason || "Ревьювер отклонил выполнение";
 
-    if (shouldRetryCi(this.reviewRetryCount, maxRetries)) {
-      this.reviewRetryCount += 1;
-      this.sendingPrompt = true;
-      this.setState("advancing");
-      this.statusReason = `Ревью: возврат на доработку (${summary})`;
+    if (shouldRetryCi(session.reviewRetryCount, maxRetries)) {
+      session.reviewRetryCount += 1;
+      session.sendingPrompt = true;
+      this.setSessionState(session, "advancing");
+      session.statusReason = `Ревью: возврат на доработку (${summary})`;
       const maxLabel = maxRetries === 0 ? "∞" : String(maxRetries);
       this.addLog(
+        session,
         "warn",
-        `Ревью отклонено (попытка ${this.reviewRetryCount}/${maxLabel}): ${summary}`,
+        `Ревью отклонено (попытка ${session.reviewRetryCount}/${maxLabel}): ${summary}`,
       );
       cx.notify();
 
@@ -1635,47 +1754,48 @@ export default class Orca extends View {
           item.epic,
           item.task,
           verdict,
-          this.reviewRetryCount,
+          session.reviewRetryCount,
           maxRetries,
         );
         const sendRes = await hc(["send", runCtx.terminal, fixPrompt]).catch((e) => ({
           code: 1,
           stderr: String(e),
         }));
-        if (this.runSeq !== seq) return;
+        if (session.runSeq !== seq) return;
 
         if (sendRes.code !== 0) {
-          this.sendingPrompt = false;
+          session.sendingPrompt = false;
           this.failRun(
+            session,
             `Не удалось отправить замечания ревью в ${runCtx.terminal}: ${sendRes.stderr || "ошибка hc send"}`,
             cx,
           );
           return;
         }
 
-        this.sentAt = Date.now();
-        this.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
-        this.sawWorkingSinceSend = this.lastAgentStatus === "working";
-        this.idleSince = null;
-        this.sendingPrompt = false;
-        this.setState("watching");
-        this.addLog("info", `Отправлены замечания ревью (попытка ${this.reviewRetryCount})`);
+        session.sentAt = Date.now();
+        session.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
+        session.sawWorkingSinceSend = session.lastAgentStatus === "working";
+        session.idleSince = null;
+        session.sendingPrompt = false;
+        this.setSessionState(session, "watching");
+        this.addLog(session, "info", `Отправлены замечания ревью (попытка ${session.reviewRetryCount})`);
         cx.notify();
       } finally {
-        if (this.runSeq === seq) {
-          this.sendingPrompt = false;
+        if (session.runSeq === seq) {
+          session.sendingPrompt = false;
         }
       }
       return;
     }
 
-    this.runSeq++;
-    this.setState("error");
-    this.statusReason = `Исчерпан лимит попыток ревью (${maxRetries}): ${summary}`;
-    this.addLog("error", this.statusReason);
+    session.runSeq++;
+    this.setSessionState(session, "error");
+    session.statusReason = `Исчерпан лимит попыток ревью (${maxRetries}): ${summary}`;
+    this.addLog(session, "error", session.statusReason);
     notify({
-      title: "Orca: ревью не пройдено",
-      body: this.statusReason,
+      title: `Orca (${runCtx.terminal}): ревью не пройдено`,
+      body: session.statusReason,
       level: "error",
       action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
     });
@@ -1683,12 +1803,13 @@ export default class Orca extends View {
     cx.notify();
   }
 
-  enterWaitingCi(reason, cx) {
+  enterWaitingCi(session, reason, cx) {
     const pollMs = this.getCiPollMs();
-    this.nextCiCheckAt = Date.now() + pollMs;
-    this.statusReason = reason || null;
-    this.setState("waiting_ci");
+    session.nextCiCheckAt = Date.now() + pollMs;
+    session.statusReason = reason || null;
+    this.setSessionState(session, "waiting_ci");
     this.addLog(
+      session,
       "info",
       `Ожидание CI (следующая проверка через ${Math.round(pollMs / 60000)} мин)`,
     );
@@ -1696,106 +1817,109 @@ export default class Orca extends View {
   }
 
   checkCiNow(cx) {
-    if (this.state !== "waiting_ci" || this.ciChecking) return;
-    this.runCiCheck(cx);
+    const session = this.activeSession();
+    if (session.state !== "waiting_ci" || session.ciChecking) return;
+    this.runCiCheck(session, cx);
   }
 
-  runCiCheck(cx) {
-    if (this.ciChecking) return;
-    const runCtx = this.boundRun;
-    const item = this.currentItem;
+  runCiCheck(session, cx) {
+    if (!session || session.ciChecking) return;
+    const runCtx = session.boundRun;
+    const item = session.currentItem;
     if (!runCtx || !item) return;
 
     if (!runCtx.projectRoot) {
-      this.pausedFromState = "waiting_ci";
-      this.runSeq++;
-      this.setState("paused");
-      this.statusReason = "Не определён корень проекта для проверки CI";
-      this.addLog("error", this.statusReason);
-      notify({ title: "Orca: ошибка CI", body: this.statusReason, level: "warning" });
+      session.pausedFromState = "waiting_ci";
+      session.runSeq++;
+      this.setSessionState(session, "paused");
+      session.statusReason = "Не определён корень проекта для проверки CI";
+      this.addLog(session, "error", session.statusReason);
+      notify({ title: `Orca (${runCtx.terminal}): ошибка CI`, body: session.statusReason, level: "warning" });
       playSound("blocked");
       cx.notify();
       return;
     }
 
-    this.ciChecking = true;
-    const seq = this.runSeq;
-    this.nextCiCheckAt = null;
-    this.addLog("info", "Проверка статуса GitHub CI…");
+    session.ciChecking = true;
+    const seq = session.runSeq;
+    session.nextCiCheckAt = null;
+    this.addLog(session, "info", "Проверка статуса GitHub CI…");
     cx.notify();
 
     cx.spawn(async (cx) => {
       try {
         const ci = await checkGithubCiStatus(runCtx.projectRoot, runCtx.on, exec);
-        if (this.runSeq !== seq) return;
-        this.ciInfo = ci;
+        if (session.runSeq !== seq) return;
+        session.ciInfo = ci;
 
         if (ci.state === "success") {
-          this.addLog("success", ci.summary || "CI прошёл успешно");
-          await this.markDoneAndAdvance(seq, cx);
+          this.addLog(session, "success", ci.summary || "CI прошёл успешно");
+          await this.markDoneAndAdvance(session, seq, cx);
           return;
         }
 
         if (ci.state === "pending") {
-          this.nextCiCheckAt = Date.now() + this.getCiPollMs();
-          this.statusReason = ci.summary || "CI ещё выполняется";
+          session.nextCiCheckAt = Date.now() + this.getCiPollMs();
+          session.statusReason = ci.summary || "CI ещё выполняется";
           this.addLog(
+            session,
             "info",
-            `${this.statusReason} — следующая проверка через ${this.settings.ciPollMinutes || 5} мин`,
+            `${session.statusReason} — следующая проверка через ${this.settings.ciPollMinutes || 5} мин`,
           );
           return;
         }
 
         if (ci.state === "failure") {
-          await this.handleCiFailure(runCtx, item, ci, seq, cx);
+          await this.handleCiFailure(session, runCtx, item, ci, seq, cx);
           return;
         }
 
-        this.pausedFromState = "waiting_ci";
-        this.runSeq++;
-        this.setState("paused");
-        this.statusReason = ci.summary || "Не удалось получить статус CI";
-        this.addLog("error", this.statusReason);
+        session.pausedFromState = "waiting_ci";
+        session.runSeq++;
+        this.setSessionState(session, "paused");
+        session.statusReason = ci.summary || "Не удалось получить статус CI";
+        this.addLog(session, "error", session.statusReason);
         notify({
-          title: "Orca: ошибка проверки CI",
-          body: this.statusReason,
+          title: `Orca (${runCtx.terminal}): ошибка проверки CI`,
+          body: session.statusReason,
           level: "warning",
         });
         playSound("blocked");
       } catch (err) {
-        if (this.runSeq !== seq) return;
-        this.pausedFromState = "waiting_ci";
-        this.runSeq++;
-        this.setState("paused");
-        this.statusReason = `Ошибка проверки CI: ${String(err?.message ?? err)}`;
-        this.addLog("error", this.statusReason);
+        if (session.runSeq !== seq) return;
+        session.pausedFromState = "waiting_ci";
+        session.runSeq++;
+        this.setSessionState(session, "paused");
+        session.statusReason = `Ошибка проверки CI: ${String(err?.message ?? err)}`;
+        this.addLog(session, "error", session.statusReason);
         notify({
-          title: "Orca: ошибка проверки CI",
-          body: this.statusReason,
+          title: `Orca (${runCtx.terminal}): ошибка проверки CI`,
+          body: session.statusReason,
           level: "error",
         });
         playSound("blocked");
       } finally {
-        this.ciChecking = false;
-        if (this.runSeq === seq) {
-          this.sendingPrompt = false;
+        session.ciChecking = false;
+        if (session.runSeq === seq) {
+          session.sendingPrompt = false;
         }
         cx.notify();
       }
     });
   }
 
-  async handleCiFailure(runCtx, item, ci, seq, cx) {
+  async handleCiFailure(session, runCtx, item, ci, seq, cx) {
     const maxRetries = this.settings?.maxCiRetries ?? 3;
-    if (shouldRetryCi(this.ciRetryCount, maxRetries)) {
-      this.ciRetryCount += 1;
-      this.sendingPrompt = true;
-      this.setState("fixing_ci");
-      this.statusReason = ci.summary || "CI упал — отправка логов агенту";
+    if (shouldRetryCi(session.ciRetryCount, maxRetries)) {
+      session.ciRetryCount += 1;
+      session.sendingPrompt = true;
+      this.setSessionState(session, "fixing_ci");
+      session.statusReason = ci.summary || "CI упал — отправка логов агенту";
       const maxLabel = maxRetries === 0 ? "∞" : String(maxRetries);
       this.addLog(
+        session,
         "warn",
-        `CI упал (попытка ${this.ciRetryCount}/${maxLabel}): ${ci.summary}`,
+        `CI упал (попытка ${session.ciRetryCount}/${maxLabel}): ${ci.summary}`,
       );
       cx.notify();
 
@@ -1806,54 +1930,55 @@ export default class Orca extends View {
           runCtx.on,
           exec,
         );
-        if (this.runSeq !== seq) return;
+        if (session.runSeq !== seq) return;
 
         const fixPrompt = buildCiFixPrompt(
           item.epic,
           item.task,
           ci,
           logTail,
-          this.ciRetryCount,
+          session.ciRetryCount,
           maxRetries,
         );
         const sendRes = await hc(["send", runCtx.terminal, fixPrompt]).catch((e) => ({
           code: 1,
           stderr: String(e),
         }));
-        if (this.runSeq !== seq) return;
+        if (session.runSeq !== seq) return;
 
         if (sendRes.code !== 0) {
-          this.sendingPrompt = false;
+          session.sendingPrompt = false;
           this.failRun(
+            session,
             `Не удалось отправить фикс CI в ${runCtx.terminal}: ${sendRes.stderr || "ошибка hc send"}`,
             cx,
           );
           return;
         }
 
-        this.sentAt = Date.now();
-        this.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
-        this.sawWorkingSinceSend = this.lastAgentStatus === "working";
-        this.idleSince = null;
-        this.sendingPrompt = false;
-        this.setState("watching");
-        this.addLog("info", `Отправлен промпт фикса CI (попытка ${this.ciRetryCount})`);
+        session.sentAt = Date.now();
+        session.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
+        session.sawWorkingSinceSend = session.lastAgentStatus === "working";
+        session.idleSince = null;
+        session.sendingPrompt = false;
+        this.setSessionState(session, "watching");
+        this.addLog(session, "info", `Отправлен промпт фикса CI (попытка ${session.ciRetryCount})`);
         cx.notify();
       } finally {
-        if (this.runSeq === seq) {
-          this.sendingPrompt = false;
+        if (session.runSeq === seq) {
+          session.sendingPrompt = false;
         }
       }
       return;
     }
 
-    this.runSeq++;
-    this.setState("error");
-    this.statusReason = `Исчерпан лимит попыток фикса CI (${maxRetries}): ${ci.summary}`;
-    this.addLog("error", this.statusReason);
+    session.runSeq++;
+    this.setSessionState(session, "error");
+    session.statusReason = `Исчерпан лимит попыток фикса CI (${maxRetries}): ${ci.summary}`;
+    this.addLog(session, "error", session.statusReason);
     notify({
-      title: "Orca: CI не исправлен",
-      body: this.statusReason,
+      title: `Orca (${runCtx.terminal}): CI не исправлен`,
+      body: session.statusReason,
       level: "error",
       action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
     });
@@ -1861,130 +1986,195 @@ export default class Orca extends View {
     cx.notify();
   }
 
+  withFileLock(filePath, fn) {
+    const prev = this.fileWriteLocks.get(filePath) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    const settled = next.catch(() => {});
+    this.fileWriteLocks.set(filePath, settled);
+    return next;
+  }
+
   async markItemStatusOnDisk(item, status, on) {
     const epic = item.epic;
     const task = item.task;
-    const nextText = task
-      ? updateTaskStatus(epic.rawText, task.lineIndex, status)
-      : updateEpicStatus(epic.rawText, status);
+    return this.withFileLock(epic.filePath, async () => {
+      const nextText = task
+        ? updateTaskStatus(epic.rawText, task.lineIndex, status)
+        : updateEpicStatus(epic.rawText, status);
 
-    if (nextText === epic.rawText) return;
+      if (nextText === epic.rawText) return;
 
-    try {
-      await writeTextFile(epic.filePath, nextText, epic.rawText);
-    } catch {
-      const freshRaw = await readTextFile(epic.filePath, { on }).catch(() => null);
-      if (freshRaw === null) {
-        throw new Error(`Не удалось перечитать ${epic.filePath}`);
+      try {
+        await writeTextFile(epic.filePath, nextText, epic.rawText);
+      } catch {
+        const freshRaw = await readTextFile(epic.filePath, { on }).catch(() => null);
+        if (freshRaw === null) {
+          throw new Error(`Не удалось перечитать ${epic.filePath}`);
+        }
+        const freshEpic = parseEpicFile(epic.filename, freshRaw, epic.filePath);
+        let freshTask = null;
+        if (task) {
+          freshTask =
+            freshEpic.tasks.find((t) => t.hasExplicitId && t.id === task.id) ??
+            freshEpic.tasks.find((t) => t.title === task.title) ??
+            freshEpic.tasks[task.index] ??
+            null;
+          if (!freshTask) return;
+        }
+        const retryText = freshTask
+          ? updateTaskStatus(freshRaw, freshTask.lineIndex, status)
+          : updateEpicStatus(freshRaw, status);
+        if (retryText === freshRaw) return;
+        await writeTextFile(epic.filePath, retryText, freshRaw);
       }
-      const freshEpic = parseEpicFile(epic.filename, freshRaw, epic.filePath);
-      let freshTask = null;
-      if (task) {
-        freshTask =
-          freshEpic.tasks.find((t) => t.hasExplicitId && t.id === task.id) ??
-          freshEpic.tasks.find((t) => t.title === task.title) ??
-          freshEpic.tasks[task.index] ??
-          null;
-        if (!freshTask) return;
-      }
-      const retryText = freshTask
-        ? updateTaskStatus(freshRaw, freshTask.lineIndex, status)
-        : updateEpicStatus(freshRaw, status);
-      if (retryText === freshRaw) return;
-      await writeTextFile(epic.filePath, retryText, freshRaw);
-    }
+    });
   }
 
   async markItemDoneOnDisk(item, on) {
     return this.markItemStatusOnDisk(item, "done", on);
   }
 
-  async markDoneAndAdvance(seq, cx) {
-    const runCtx = this.boundRun;
-    const item = this.currentItem;
+  async markDoneAndAdvance(session, seq, cx) {
+    const runCtx = session?.boundRun;
+    const item = session?.currentItem;
     if (!runCtx || !item) return;
 
-    this.setState("advancing");
+    this.setSessionState(session, "advancing");
     cx.notify();
 
     const doneLabel = item.task ? `${item.epic.id} · ${item.task.id}` : item.epic.id;
     await this.markItemDoneOnDisk(item, runCtx.on);
-    if (this.runSeq !== seq) return;
+    if (session.runSeq !== seq) return;
 
-    this.addLog("success", `Отмечено выполненным: ${doneLabel}`);
+    this.addLog(session, "success", `Отмечено выполненным: ${doneLabel}`);
 
-    await this.reloadEpicsForDir(runCtx.backlogDir, runCtx.on);
-    if (this.runSeq !== seq) return;
+    await this.reloadEpicsForSession(session, runCtx.backlogDir, runCtx.on);
+    if (session.runSeq !== seq) return;
 
-    this.ciRetryCount = 0;
-    this.reviewRetryCount = 0;
-    this.reviewProgress = null;
-    this.ciInfo = null;
-    this.nextCiCheckAt = null;
-    this.lastVerdict = null;
-    this.statusReason = null;
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.lastVerdict = null;
+    session.statusReason = null;
 
-    const next = this.pickNextAvailableItem();
+    const next = this.pickNextAvailableItem(session);
     if (!next) {
-      this.completeBacklog(cx);
+      this.completeBacklog(session, cx);
       return;
     }
 
-    this.currentItem = next;
+    session.currentItem = next;
     const nextLabel = next.task ? `${next.epic.id} · ${next.task.id}` : next.epic.id;
-    await this.markItemStatusOnDisk(next, "in_progress", runCtx.on).catch(() => {});
-    await this.reloadEpicsForDir(runCtx.backlogDir, runCtx.on).catch(() => {});
-    if (this.runSeq !== seq) return;
+    session.sendingPrompt = true;
+    try {
+      if (shouldRunAutoCompact(this.settings?.autoCompact, next)) {
+        session.statusReason = "Компакт сессии (/compact)…";
+        this.addLog(session, "info", `Автокомпакт: отправка /compact в ${runCtx.terminal}…`);
+        cx.notify();
 
-    const activeNext = this.currentItem ?? next;
-    const prompt = buildAgentPrompt(activeNext.epic, activeNext.task, runCtx.projectRoot);
-    const sendRes = await hc(["send", runCtx.terminal, prompt]).catch((e) => ({
-      code: 1,
-      stderr: String(e),
-    }));
-    if (this.runSeq !== seq) return;
+        const compactRes = await hc(["send", runCtx.terminal, "/compact"]).catch((e) => ({
+          code: 1,
+          stderr: String(e),
+        }));
+        if (session.runSeq !== seq) return;
 
-    if (sendRes.code !== 0) {
-      this.failRun(
-        `Не удалось отправить следующую задачу в ${runCtx.terminal}: ${sendRes.stderr || "ошибка hc send"}`,
-        cx,
-      );
-      return;
+        if (compactRes.code !== 0) {
+          this.failRun(
+            session,
+            `Не удалось отправить /compact в ${runCtx.terminal}: ${compactRes.stderr || "ошибка hc send"}`,
+            cx,
+          );
+          return;
+        }
+
+        let sawCompactWorking = false;
+        for (let i = 0; i < 10; i++) {
+          await cx.sleep(300);
+          if (session.runSeq !== seq) return;
+          if (this.readTerminalAgentStatus(runCtx.terminal) === "working") {
+            sawCompactWorking = true;
+            break;
+          }
+        }
+
+        if (sawCompactWorking) {
+          await hc(["wait", runCtx.terminal, "--timeout", "120", "--json"]).catch(() => null);
+          if (session.runSeq !== seq) return;
+        } else {
+          await cx.sleep(1000);
+          if (session.runSeq !== seq) return;
+        }
+
+        session.statusReason = null;
+        this.addLog(session, "info", "Автокомпакт завершён");
+      }
+
+      await this.markItemStatusOnDisk(next, "in_progress", runCtx.on).catch(() => {});
+      await this.reloadEpicsForSession(session, runCtx.backlogDir, runCtx.on).catch(() => {});
+      if (session.runSeq !== seq) return;
+
+      const activeNext = session.currentItem ?? next;
+      const prompt = buildAgentPrompt(activeNext.epic, activeNext.task, runCtx.projectRoot);
+      const sendRes = await hc(["send", runCtx.terminal, prompt]).catch((e) => ({
+        code: 1,
+        stderr: String(e),
+      }));
+      if (session.runSeq !== seq) return;
+
+      if (sendRes.code !== 0) {
+        this.failRun(
+          session,
+          `Не удалось отправить следующую задачу в ${runCtx.terminal}: ${sendRes.stderr || "ошибка hc send"}`,
+          cx,
+        );
+        return;
+      }
+
+      session.sentAt = Date.now();
+      session.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
+      session.sawWorkingSinceSend = session.lastAgentStatus === "working";
+      session.idleSince = null;
+      this.setSessionState(session, "watching");
+      this.addLog(session, "info", `Запущена следующая задача: ${nextLabel}`);
+      cx.notify();
+    } finally {
+      if (session.runSeq === seq) {
+        session.sendingPrompt = false;
+      }
     }
-
-    this.sentAt = Date.now();
-    this.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
-    this.sawWorkingSinceSend = this.lastAgentStatus === "working";
-    this.idleSince = null;
-    this.setState("watching");
-    this.addLog("info", `Запущена следующая задача: ${nextLabel}`);
-    cx.notify();
   }
 
-  completeBacklog(cx) {
-    this.runSeq++;
-    this.sendingPrompt = false;
-    this.boundRun = null;
-    this.currentItem = null;
-    this.skippedKeys.clear();
-    this.ciRetryCount = 0;
-    this.reviewRetryCount = 0;
-    this.reviewProgress = null;
-    this.ciInfo = null;
-    this.nextCiCheckAt = null;
-    this.lastVerdict = null;
-    this.statusReason = null;
-    this.pausedFromState = null;
-    this.sentAt = 0;
-    this.sawWorkingSinceSend = false;
-    this.idleSince = null;
-    this.lastAgentStatus = null;
-    this.setState("idle");
-    this.addLog("success", "Весь бэклог выполнен!");
+  completeBacklog(session, cx) {
+    if (!session) return;
+    session.runSeq++;
+    session.sendingPrompt = false;
+    session.boundRun = null;
+    session.currentItem = null;
+    session.skippedKeys.clear();
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.lastVerdict = null;
+    session.statusReason = null;
+    session.pausedFromState = null;
+    session.sentAt = 0;
+    session.sawWorkingSinceSend = false;
+    session.idleSince = null;
+    session.lastAgentStatus = null;
+    this.setSessionState(session, "idle");
+    this.syncWatches(cx);
+    this.addLog(session, "success", "Весь бэклог выполнен!");
     notify({
-      title: "Orca: бэклог выполнен",
+      title: `Orca (${session.terminal}): бэклог выполнен`,
       body: "Все открытые задачи завершены",
       level: "success",
+      ...(session.terminal
+        ? { action: { name: "pane.focus", args: { terminal: session.terminal } } }
+        : {}),
     });
     playSound("done");
     cx.notify();
@@ -2004,10 +2194,18 @@ export default class Orca extends View {
   }
 
   render(cx) {
-    if (!checking() && this.state === "idle") {
-      const ctx = this.resolveContext();
-      if (ctx.key !== this.contextKey) {
-        this.refresh(cx, true);
+    if (!checking()) {
+      const prevSelected = this.selectedTerminal;
+      this.syncSelectedTerminalWithFocus();
+      const session = this.activeSession();
+      if (session.terminal) {
+        const ctx = this.resolveSessionContext(session);
+        if (
+          prevSelected !== this.selectedTerminal ||
+          (session.state === "idle" && ctx.key !== session.contextKey)
+        ) {
+          this.refreshSession(session, cx, true);
+        }
       }
     }
 

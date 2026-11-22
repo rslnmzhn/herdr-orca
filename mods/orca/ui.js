@@ -254,15 +254,17 @@ function logLevelColor(t, level) {
 }
 
 export function renderHeader(view, t) {
-  const meta = statusMeta(t, view.state);
+  const s = view.activeSession?.() ?? view;
+  const meta = statusMeta(t, s.state);
   const isSpinning =
-    view.state === "watching" ||
-    view.state === "classifying" ||
-    view.state === "advancing" ||
-    view.state === "fixing_ci";
-  const isWaitingCi = view.state === "waiting_ci";
+    s.state === "watching" ||
+    s.state === "classifying" ||
+    s.state === "advancing" ||
+    s.state === "fixing_ci";
+  const isWaitingCi = s.state === "waiting_ci";
   const isActive = isSpinning || isWaitingCi;
-  const isPaused = view.state === "paused";
+  const isPaused = s.state === "paused";
+  const activeCount = view.getActiveSessions?.().filter((x) => x.isActive).length ?? (isActive ? 1 : 0);
 
   return h_flex()
     .id("orca-header")
@@ -283,8 +285,8 @@ export function renderHeader(view, t) {
           svg("mods/orca/icons/orca.svg")
             .size(16)
             .flex_none()
-            .text_color(isActive ? meta.color : t.accent)
-            .when(isActive, (el) => el.loop("opacity", { from: 0.55, to: 1, period: 1200 })),
+            .text_color(isActive || activeCount > 0 ? meta.color : t.accent)
+            .when(isActive || activeCount > 0, (el) => el.loop("opacity", { from: 0.55, to: 1, period: 1200 })),
         )
         .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child("Orca"))
         .child(
@@ -304,11 +306,14 @@ export function renderHeader(view, t) {
                   .size(11)
                   .flex_none()
                   .text_color(meta.color)
-                  .when(meta.spinning, (s) => s.spin(1100))
-                  .when(meta.pulsing, (s) => s.loop("opacity", { from: 0.35, to: 1, period: 1100 })),
+                  .when(meta.spinning, (sp) => sp.spin(1100))
+                  .when(meta.pulsing, (sp) => sp.loop("opacity", { from: 0.35, to: 1, period: 1100 })),
               ),
             )
             .child(div().text_size(10.5).font_semibold().text_color(meta.color).child(meta.label)),
+        )
+        .when(activeCount > 1, (el) =>
+          el.child(badge(`${activeCount} активн.`, t.accent, alpha(t.accent, "1e"))),
         ),
     )
     .child(div().flex_1())
@@ -317,17 +322,17 @@ export function renderHeader(view, t) {
         .flex_wrap()
         .gap(6)
         .items_center()
-        .when(view.state === "idle" || view.state === "error", (el) =>
+        .when(s.state === "idle" || s.state === "error", (el) =>
           el.child(
             solidButton("orca-btn-start", "Старт", "play", (_e, cx) => view.start(cx), t, {
-              tip: "Запустить цикл Orca",
+              tip: "Запустить цикл Orca для выбранного агента",
             }),
           ),
         )
         .when(isPaused, (el) =>
           el.child(
             solidButton("orca-btn-resume", "Продолжить", "play", (_e, cx) => view.resume(cx), t, {
-              tip: "Возобновить цикл Orca",
+              tip: "Возобновить цикл Orca для выбранного агента",
             }),
           ),
         )
@@ -352,7 +357,7 @@ export function renderHeader(view, t) {
                 icon: "x",
                 fg: t.blocked ?? t.ansi1,
                 border: alpha(t.blocked ?? t.ansi1, "55"),
-                tip: "Остановить цикл Orca",
+                tip: "Остановить цикл Orca для выбранного агента",
               }),
             ),
         ),
@@ -360,9 +365,12 @@ export function renderHeader(view, t) {
 }
 
 export function renderSessionAndBacklog(view, t) {
+  const s = view.activeSession?.() ?? view;
   const choices = view.getSessionChoices?.() ?? [];
+  const activeSessions = view.getActiveSessions?.() ?? [];
   const selected = choices.find((c) => c.address === view.selectedTerminal) ?? null;
   const selectedColor = selected ? sessionStatusColor(t, selected.status) : t.dim;
+  const autoCompact = Boolean(view.settings?.autoCompact);
 
   return v_flex()
     .id("orca-session-backlog")
@@ -373,6 +381,58 @@ export function renderSessionAndBacklog(view, t) {
     .bg(t.surface)
     .border_b(1)
     .border_color(t.border)
+    .when(activeSessions.length > 0, (el) =>
+      el.child(
+        h_flex()
+          .id("orca-active-sessions")
+          .flex_wrap()
+          .gap(5)
+          .items_center()
+          .children(
+            activeSessions.map((item, idx) => {
+              const isCurrent = item.terminal === view.selectedTerminal;
+              const meta = statusMeta(t, item.state);
+              return h_flex()
+                .id(`orca-active-sess-${idx}`)
+                .h(22)
+                .px(7)
+                .gap(5)
+                .flex_none()
+                .items_center()
+                .rounded(5)
+                .border_1()
+                .border_color(isCurrent ? meta.color : alpha(meta.color, "55"))
+                .bg(isCurrent ? alpha(meta.color, "24") : t.background)
+                .cursor_pointer()
+                .tooltip(`${item.label} (${item.terminal}) — ${meta.label}`)
+                .hover((st) => st.bg(alpha(meta.color, "20")))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => view.selectTerminal(item.terminal, cx))
+                .when(meta.spinning, (sp) =>
+                  sp.child(svg("mods/orca/icons/spinner.svg").size(10).flex_none().text_color(meta.color).spin(1100)),
+                )
+                .when(!meta.spinning, (sp) =>
+                  sp.child(
+                    div()
+                      .size(6)
+                      .rounded(3)
+                      .flex_none()
+                      .bg(meta.color)
+                      .when(meta.pulsing, (p) => p.loop("opacity", { from: 0.35, to: 1, period: 1100 })),
+                  ),
+                )
+                .child(
+                  div()
+                    .text_size(10.5)
+                    .when(isCurrent, (st) => st.font_semibold())
+                    .text_color(isCurrent ? t.foreground : t.muted)
+                    .child(`${item.programName || item.terminal} · ${item.terminal}`),
+                )
+                .child(div().text_size(10).text_color(meta.color).child(meta.label));
+            }),
+          ),
+      ),
+    )
     .child(
       h_flex()
         .flex_wrap()
@@ -393,7 +453,7 @@ export function renderSessionAndBacklog(view, t) {
             .text_color(selected ? t.foreground : t.accent)
             .cursor_pointer()
             .tooltip(selected ? `${selected.label} (${selected.address})` : "Выбрать целевую сессию агента")
-            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .hover((st) => st.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => view.toggleSessionPicker(cx))
             .child(svg("mods/orca/icons/terminal.svg").size(12).flex_none().text_color(t.muted))
@@ -425,23 +485,23 @@ export function renderSessionAndBacklog(view, t) {
             .border_color(t.border)
             .bg(t.background)
             .text_size(11.5)
-            .text_color(view.backlogDir ? t.muted : t.accent)
+            .text_color(s.backlogDir ? t.muted : t.accent)
             .cursor_pointer()
             .tooltip(
-              view.backlogDir
-                ? `${view.on ? `[${view.on}] ` : ""}${view.backlogDir}`
+              s.backlogDir
+                ? `${s.on ? `[${s.on}] ` : ""}${s.backlogDir}`
                 : "Выбрать папку backlog",
             )
-            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .hover((st) => st.bg(t.hover).text_color(t.foreground))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => view.chooseFolder(cx))
             .child(svg("mods/orca/icons/folder.svg").size(12).flex_none())
-            .child(div().max_w(170).truncate().child(shortFolderLabel(view.backlogDir))),
+            .child(div().max_w(170).truncate().child(shortFolderLabel(s.backlogDir))),
         )
-        .when(Boolean(view.on), (el) =>
-          el.child(badge(view.on, t.accent, alpha(t.accent, "20"))),
+        .when(Boolean(s.on), (el) =>
+          el.child(badge(s.on, t.accent, alpha(t.accent, "20"))),
         )
-        .when(view.readOnly, (el) =>
+        .when(s.readOnly, (el) =>
           el.child(badge("Только чтение", t.working ?? t.ansi3, alpha(t.working ?? t.ansi3, "20"))),
         )
         .child(div().flex_1())
@@ -488,7 +548,7 @@ export function renderSessionAndBacklog(view, t) {
               pillButton(
                 "orca-mode-tasks",
                 "Задачи",
-                view.mode === "tasks",
+                s.mode === "tasks",
                 (_e, cx) => view.setMode("tasks", cx),
                 t,
                 { height: 24, px: 8, textSize: 11 },
@@ -498,7 +558,7 @@ export function renderSessionAndBacklog(view, t) {
               pillButton(
                 "orca-mode-epics",
                 "Эпики",
-                view.mode === "epics",
+                s.mode === "epics",
                 (_e, cx) => view.setMode("epics", cx),
                 t,
                 { height: 24, px: 8, textSize: 11 },
@@ -513,6 +573,45 @@ export function renderSessionAndBacklog(view, t) {
                 t,
                 { size: 24, iconSize: 12 },
               ),
+            )
+            .child(
+              h_flex()
+                .id("orca-autocompact-chk")
+                .h(24)
+                .px(7)
+                .gap(5)
+                .flex_none()
+                .items_center()
+                .rounded(6)
+                .border_1()
+                .border_color(autoCompact ? alpha(t.accent, "66") : t.border)
+                .bg(autoCompact ? alpha(t.accent, "18") : t.chrome)
+                .cursor_pointer()
+                .tooltip("После каждой выполненной задачи отправлять /compact перед следующей")
+                .hover((st) => st.bg(t.hover))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => view.toggleAutoCompact(cx))
+                .child(
+                  h_flex()
+                    .size(13)
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(3)
+                    .border_1()
+                    .border_color(autoCompact ? t.accent : t.input)
+                    .bg(autoCompact ? t.accent : t.background)
+                    .when(autoCompact, (el) =>
+                      el.child(svg("mods/orca/icons/check.svg").size(9).text_color(t.solid_foreground)),
+                    ),
+                )
+                .child(
+                  div()
+                    .text_size(11)
+                    .when(autoCompact, (el) => el.font_medium())
+                    .text_color(autoCompact ? t.foreground : t.muted)
+                    .child("Автокомпакт"),
+                ),
             ),
         ),
     )
@@ -534,13 +633,15 @@ export function renderSessionAndBacklog(view, t) {
                 .py(6)
                 .text_size(11.5)
                 .text_color(t.dim)
-                .child("Нет доступных терминалов или агентов в активном space"),
+                .child("Нет доступных терминалов или агентов"),
             ),
           )
           .children(
             choices.map((choice, idx) => {
               const isSelected = choice.address === view.selectedTerminal;
               const dotColor = sessionStatusColor(t, choice.status);
+              const orcaState = choice.orcaState;
+              const orcaMeta = orcaState && orcaState !== "idle" ? statusMeta(t, orcaState) : null;
               return h_flex()
                 .id(`orca-sess-opt-${idx}`)
                 .h(28)
@@ -550,7 +651,7 @@ export function renderSessionAndBacklog(view, t) {
                 .rounded(6)
                 .bg(isSelected ? t.selected : t.background)
                 .cursor_pointer()
-                .hover((s) => s.bg(isSelected ? t.selected : t.hover))
+                .hover((st) => st.bg(isSelected ? t.selected : t.hover))
                 .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                 .on_click((_e, cx) => view.selectTerminal(choice.address, cx))
                 .child(div().size(7).rounded(4).flex_none().bg(dotColor))
@@ -560,9 +661,12 @@ export function renderSessionAndBacklog(view, t) {
                     .min_w(0)
                     .truncate()
                     .text_size(12)
-                    .when(isSelected, (s) => s.font_medium())
+                    .when(isSelected, (st) => st.font_medium())
                     .text_color(t.foreground)
                     .child(choice.label || choice.programName || choice.address),
+                )
+                .when(Boolean(orcaMeta), (b) =>
+                  b.child(badge(orcaMeta.label, orcaMeta.color, alpha(orcaMeta.color, "20"))),
                 )
                 .when(choice.isAgent, (b) =>
                   b.child(badge("Агент", t.accent, alpha(t.accent, "1e"))),
@@ -635,7 +739,8 @@ function renderPipelineStage(id, label, stageState, t, opts = {}) {
 }
 
 export function renderPipelineStrip(view, t) {
-  const state = view.state;
+  const s = view.activeSession?.() ?? view;
+  const state = s.state;
   const meta = statusMeta(t, state);
 
   let stage1 = "pending";
@@ -653,17 +758,17 @@ export function renderPipelineStrip(view, t) {
     stage3 = "active";
   }
 
-  const item = view.currentItem;
+  const item = s.currentItem;
   const epic = item?.epic ?? null;
   const task = item?.task ?? null;
   const maxRetries = view.settings?.maxCiRetries ?? 3;
   const retryLimitLabel = maxRetries === 0 ? "∞" : String(maxRetries);
-  const retryCount = view.ciRetryCount ?? 0;
+  const retryCount = s.ciRetryCount ?? 0;
   const isReviewerMode = (view.settings?.reviewMode ?? "reviewer") === "reviewer";
   const maxReviewRetries = view.settings?.maxReviewRetries ?? 3;
   const reviewLimitLabel = maxReviewRetries === 0 ? "∞" : String(maxReviewRetries);
-  const reviewRetryCount = view.reviewRetryCount ?? 0;
-  const showCiRow = state === "waiting_ci" || state === "fixing_ci" || Boolean(view.ciInfo);
+  const reviewRetryCount = s.reviewRetryCount ?? 0;
+  const showCiRow = state === "waiting_ci" || state === "fixing_ci" || Boolean(s.ciInfo);
 
   return v_flex()
     .id("orca-pipeline")
@@ -705,10 +810,10 @@ export function renderPipelineStrip(view, t) {
             spinning: state === "advancing",
           }),
         )
-        .when(state === "classifying" && Boolean(view.reviewProgress), (el) =>
+        .when(state === "classifying" && Boolean(s.reviewProgress), (el) =>
           el.child(
             badge(
-              view.reviewProgress,
+              s.reviewProgress,
               t.ansi5 ?? t.accent,
               alpha(t.ansi5 ?? t.accent, "1e"),
             ),
@@ -723,7 +828,7 @@ export function renderPipelineStrip(view, t) {
             ),
           ),
         )
-        .when(Boolean(view.lastVerdict), (el) =>
+        .when(Boolean(s.lastVerdict), (el) =>
           el.child(
             h_flex()
               .ml(4)
@@ -731,19 +836,19 @@ export function renderPipelineStrip(view, t) {
               .items_center()
               .child(
                 badge(
-                  String(view.lastVerdict.verdict || "").toUpperCase(),
-                  view.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent,
-                  alpha(view.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent, "1e"),
+                  String(s.lastVerdict.verdict || "").toUpperCase(),
+                  s.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent,
+                  alpha(s.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent, "1e"),
                 ),
               )
-              .when(Boolean(view.lastVerdict.reason), (r) =>
+              .when(Boolean(s.lastVerdict.reason), (r) =>
                 r.child(
                   div()
                     .max_w(220)
                     .truncate()
                     .text_size(11)
                     .text_color(t.muted)
-                    .child(view.lastVerdict.reason),
+                    .child(s.lastVerdict.reason),
                 ),
               ),
           ),
@@ -821,12 +926,12 @@ export function renderPipelineStrip(view, t) {
               .size(12)
               .flex_none()
               .text_color(t.ansi3 ?? t.working ?? t.accent)
-              .when(state === "waiting_ci", (s) =>
-                s.loop("opacity", { from: 0.35, to: 1, period: 1100 }),
+              .when(state === "waiting_ci", (sp) =>
+                sp.loop("opacity", { from: 0.35, to: 1, period: 1100 }),
               ),
           )
-          .when(Boolean(view.ciInfo?.branch), (b) =>
-            b.child(badge(view.ciInfo.branch, t.foreground, t.raised)),
+          .when(Boolean(s.ciInfo?.branch), (b) =>
+            b.child(badge(s.ciInfo.branch, t.foreground, t.raised)),
           )
           .child(
             div()
@@ -835,12 +940,12 @@ export function renderPipelineStrip(view, t) {
               .truncate()
               .text_size(11.5)
               .text_color(t.foreground)
-              .child(view.ciInfo?.summary || view.ciInfo?.state || "Проверка CI"),
+              .child(s.ciInfo?.summary || s.ciInfo?.state || "Проверка CI"),
           )
-          .when(state === "waiting_ci" && Boolean(view.nextCiCheckAt), (c) =>
+          .when(state === "waiting_ci" && Boolean(s.nextCiCheckAt), (c) =>
             c.child(
               badge(
-                formatCountdown(view.nextCiCheckAt),
+                formatCountdown(s.nextCiCheckAt),
                 t.ansi3 ?? t.working ?? t.accent,
                 alpha(t.ansi3 ?? t.working ?? t.accent, "22"),
               ),
@@ -867,7 +972,7 @@ export function renderPipelineStrip(view, t) {
           ),
       ),
     )
-    .when(Boolean(view.statusReason), (el) => {
+    .when(Boolean(s.statusReason), (el) => {
       const isErr = state === "error";
       const bannerColor = isErr ? (t.blocked ?? t.ansi1) : t.muted;
       return el.child(
@@ -889,7 +994,7 @@ export function renderPipelineStrip(view, t) {
               .min_w(0)
               .text_size(11.5)
               .text_color(isErr ? bannerColor : t.muted)
-              .child(view.statusReason),
+              .child(s.statusReason),
           ),
       );
     });
@@ -904,8 +1009,9 @@ function isSameQueueItem(a, b) {
 }
 
 export function renderQueueAndLog(view, t) {
+  const s = view.activeSession?.() ?? view;
   const queueItems = view.getQueueItems?.() ?? [];
-  const logs = view.logs ?? [];
+  const logs = s.logs ?? [];
   const wide = (view.size?.width ?? 0) >= 720;
 
   const queuePanel = v_flex()
@@ -933,7 +1039,7 @@ export function renderQueueAndLog(view, t) {
           div()
             .text_size(10.5)
             .text_color(t.dim)
-            .child(view.mode === "epics" ? "Эпики" : "Задачи"),
+            .child(s.mode === "epics" ? "Эпики" : "Задачи"),
         ),
     )
     .child(
@@ -959,13 +1065,13 @@ export function renderQueueAndLog(view, t) {
                       .text_center()
                       .text_size(12)
                       .text_color(t.dim)
-                      .child(view.backlogDir ? "Нет открытых задач в очереди" : "Выберите папку backlog"),
+                      .child(s.backlogDir ? "Нет открытых задач в очереди" : "Выберите папку backlog"),
                   ),
                 )
                 .children(
                   queueItems.map((item, idx) => {
                     const { epic, task } = item;
-                    const isCurrent = isSameQueueItem(item, view.currentItem);
+                    const isCurrent = isSameQueueItem(item, s.currentItem);
                     const itemId = task ? task.id : epic.id;
                     const itemTitle = task ? task.title : epic.title;
                     return h_flex()
