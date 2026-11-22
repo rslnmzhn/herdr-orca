@@ -236,6 +236,8 @@ export default class Orca extends View {
     this.availableModels = [];
     this.modelsLoading = false;
     this.modelsError = null;
+    this.modelPickerOpen = false;
+    this.modelFilter = "";
 
     this.baseUrlInput = InputState.new({
       placeholder: "https://api.openai.com/v1",
@@ -255,6 +257,14 @@ export default class Orca extends View {
       value: this.settings.model,
     });
     this.modelInput.on("submit", (_e, cx) => this.saveSettings(cx));
+
+    this.modelSearchInput = InputState.new({
+      placeholder: "Фильтр моделей…",
+    });
+    this.modelSearchInput.on("change", (_e, cx) => {
+      this.modelFilter = this.modelSearchInput.value();
+      cx.notify();
+    });
 
     this.maxRetriesInput = InputState.new({
       placeholder: "3",
@@ -988,6 +998,9 @@ export default class Orca extends View {
 
   toggleSettings(cx) {
     this.settingsOpen = !this.settingsOpen;
+    this.modelPickerOpen = false;
+    this.modelFilter = "";
+    this.modelSearchInput.set_value("");
     if (this.settingsOpen) {
       this.baseUrlInput.set_value(this.settings.baseUrl || "");
       this.apiKeyInput.set_value(this.settings.apiKey || "");
@@ -1007,8 +1020,21 @@ export default class Orca extends View {
     cx.notify();
   }
 
+  toggleModelPicker(cx) {
+    if (!this.availableModels?.length) return;
+    this.modelPickerOpen = !this.modelPickerOpen;
+    if (this.modelPickerOpen) {
+      this.modelFilter = "";
+      this.modelSearchInput.set_value("");
+    }
+    cx.notify();
+  }
+
   selectModel(modelId, cx) {
     this.modelInput.set_value(modelId);
+    this.modelPickerOpen = false;
+    this.modelFilter = "";
+    this.modelSearchInput.set_value("");
     this.modelsError = null;
     cx.notify();
   }
@@ -1024,6 +1050,9 @@ export default class Orca extends View {
     const apiKey = this.apiKeyInput.value();
     this.modelsLoading = true;
     this.modelsError = null;
+    this.modelPickerOpen = false;
+    this.modelFilter = "";
+    this.modelSearchInput.set_value("");
     cx.notify();
 
     cx.spawn(async (cx) => {
@@ -1110,6 +1139,9 @@ export default class Orca extends View {
     setShared(STORAGE_SETTINGS, this.settings);
     this.modelsError = null;
     this.settingsOpen = false;
+    this.modelPickerOpen = false;
+    this.modelFilter = "";
+    this.modelSearchInput.set_value("");
     this.publishUiState();
     this.handle.focus();
 
@@ -2184,6 +2216,10 @@ export default class Orca extends View {
     if (e.key === "escape") {
       if (this.sessionPickerOpen) {
         this.sessionPickerOpen = false;
+        cx.stop_propagation();
+        cx.notify();
+      } else if (this.modelPickerOpen) {
+        this.modelPickerOpen = false;
         cx.stop_propagation();
         cx.notify();
       } else if (this.settingsOpen) {

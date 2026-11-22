@@ -1255,7 +1255,13 @@ function renderInputBox(id, state, t, opts = {}) {
 export function renderFooterAndSettings(view, t) {
   const activeModel = view.settings?.model || "Модель не задана";
   const models = view.availableModels ?? [];
-  const visibleModels = models.slice(0, 24);
+  const modelQuery = (view.modelFilter ?? "").trim().toLowerCase();
+  const filteredModels = modelQuery
+    ? models.filter((m) => m.toLowerCase().includes(modelQuery))
+    : models;
+  const selectedModel = view.modelInput ? view.modelInput.value().trim() : view.settings?.model;
+  const maxDropdownH = Math.max(90, Math.min(180, Math.round(((view.size?.height ?? 800) - 360) * 0.5)));
+  const dropdownListHeight = Math.min(maxDropdownH, Math.max(40, filteredModels.length * 28 + 12));
 
   return v_flex()
     .id("orca-footer-wrap")
@@ -1335,7 +1341,25 @@ export function renderFooterAndSettings(view, t) {
                       .min_w(180)
                       .gap(4)
                       .child(div().text_size(11).font_medium().text_color(t.muted).child("Модель"))
-                      .child(renderInputBox("orca-input-model", view.modelInput, t)),
+                      .child(
+                        renderInputBox("orca-input-model", view.modelInput, t, {
+                          trailing:
+                            models.length > 0
+                              ? iconButton(
+                                  "orca-model-dropdown-btn",
+                                  view.modelPickerOpen ? "chevron-down" : "chevron-right",
+                                  `Выбрать модель из списка (${models.length})`,
+                                  (_e, cx) => view.toggleModelPicker(cx),
+                                  t,
+                                  {
+                                    size: 20,
+                                    iconSize: 12,
+                                    color: view.modelPickerOpen ? t.accent : t.muted,
+                                  },
+                                )
+                              : null,
+                        }),
+                      ),
                   )
                   .child(
                     pillButton(
@@ -1367,6 +1391,129 @@ export function renderFooterAndSettings(view, t) {
                       .child(renderInputBox("orca-input-review-retries", view.maxReviewRetriesInput, t)),
                   ),
               )
+              .when(models.length > 0, (el) =>
+                el.child(
+                  h_flex()
+                    .id("orca-model-picker-toggle")
+                    .h(26)
+                    .px(8)
+                    .gap(6)
+                    .items_center()
+                    .rounded(6)
+                    .border_1()
+                    .border_color(view.modelPickerOpen ? t.accent : t.border)
+                    .bg(view.modelPickerOpen ? t.selected : t.background)
+                    .text_size(11.5)
+                    .text_color(view.modelPickerOpen ? t.foreground : t.muted)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .on_click((_e, cx) => view.toggleModelPicker(cx))
+                    .child(
+                      div()
+                        .flex_1()
+                        .min_w(0)
+                        .truncate()
+                        .child(
+                          selectedModel
+                            ? `Выбрать модель (${models.length}): ${selectedModel}`
+                            : `Выбрать модель из списка (${models.length})`,
+                        ),
+                    )
+                    .child(
+                      svg(`mods/orca/icons/${view.modelPickerOpen ? "chevron-down" : "chevron-right"}.svg`)
+                        .size(11)
+                        .flex_none()
+                        .text_color(t.dim),
+                    ),
+                ),
+              )
+              .when(view.modelPickerOpen && models.length > 0, (el) =>
+                el.child(
+                  v_flex()
+                    .id("orca-model-dropdown")
+                    .rounded(8)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .overflow_hidden()
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .when(models.length > 6, (box) =>
+                      box.child(
+                        div()
+                          .p(6)
+                          .border_b(1)
+                          .border_color(t.border)
+                          .child(renderInputBox("orca-model-search", view.modelSearchInput, t)),
+                      ),
+                    )
+                    .child(
+                      div()
+                        .h(dropdownListHeight)
+                        .w_full()
+                        .relative()
+                        .child(
+                          div()
+                            .id("orca-models-scroll")
+                            .absolute()
+                            .inset_0()
+                            .overflow_y_scroll()
+                            .child(
+                              v_flex()
+                                .w_full()
+                                .p(5)
+                                .gap(2)
+                                .when(filteredModels.length === 0, (empty) =>
+                                  empty.child(
+                                    div()
+                                      .px(8)
+                                      .py(6)
+                                      .text_size(11.5)
+                                      .text_color(t.dim)
+                                      .child("Модели не найдены"),
+                                  ),
+                                )
+                                .children(
+                                  filteredModels.map((modelId, idx) => {
+                                    const isCurrent = modelId === selectedModel;
+                                    return h_flex()
+                                      .id(`orca-model-opt-${idx}`)
+                                      .h(26)
+                                      .px(8)
+                                      .gap(6)
+                                      .items_center()
+                                      .rounded(5)
+                                      .bg(isCurrent ? t.selected : t.background)
+                                      .cursor_pointer()
+                                      .hover((s) => s.bg(isCurrent ? t.selected : t.hover))
+                                      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                                      .on_click((_e, cx) => view.selectModel(modelId, cx))
+                                      .child(
+                                        div()
+                                          .flex_1()
+                                          .min_w(0)
+                                          .truncate()
+                                          .text_size(11.5)
+                                          .when(isCurrent, (s) => s.font_medium())
+                                          .text_color(isCurrent ? t.accent : t.foreground)
+                                          .child(modelId),
+                                      )
+                                      .when(isCurrent, (chk) =>
+                                        chk.child(
+                                          svg("mods/orca/icons/check.svg")
+                                            .size(11)
+                                            .flex_none()
+                                            .text_color(t.accent),
+                                        ),
+                                      );
+                                  }),
+                                ),
+                            ),
+                        )
+                        .child(Scrollbar.vertical("orca-models-scroll").absolute().inset_0()),
+                    ),
+                ),
+              )
               .child(
                 h_flex()
                   .justify_end()
@@ -1389,44 +1536,6 @@ export function renderFooterAndSettings(view, t) {
                     .text_size(11)
                     .text_color(t.blocked ?? t.ansi1)
                     .child(view.modelsError),
-                ),
-              )
-              .when(visibleModels.length > 0, (list) =>
-                list.child(
-                  h_flex()
-                    .flex_wrap()
-                    .gap(4)
-                    .children(
-                      visibleModels.map((modelId, idx) => {
-                        const selectedModel =
-                          view.modelInput?.value?.()?.trim() || view.settings?.model;
-                        const isCurrent = modelId === selectedModel;
-                        return pillButton(
-                          `orca-model-chip-${idx}`,
-                          modelId,
-                          isCurrent,
-                          (_e, cx) => view.selectModel(modelId, cx),
-                          t,
-                          {
-                            height: 22,
-                            px: 7,
-                            textSize: 10.5,
-                            activeFg: t.accent,
-                            activeBg: alpha(t.accent, "20"),
-                            activeBorder: alpha(t.accent, "66"),
-                          },
-                        );
-                      }),
-                    )
-                    .when(models.length > visibleModels.length, (more) =>
-                      more.child(
-                        div()
-                          .px(6)
-                          .text_size(10.5)
-                          .text_color(t.dim)
-                          .child(`+${models.length - visibleModels.length}`),
-                      ),
-                    ),
                 ),
               ),
           )
