@@ -366,6 +366,7 @@ export default class Orca extends View {
     const spaceId = this.boundRun?.spaceId ?? this.activeSpaceId ?? null;
     const terminal = this.boundRun?.terminal ?? this.selectedTerminal ?? null;
     const maxCiRetries = this.settings?.maxCiRetries ?? 3;
+    const reviewMode = this.settings?.reviewMode ?? "reviewer";
     const next = {
       state: this.state,
       label: meta.label,
@@ -373,6 +374,7 @@ export default class Orca extends View {
       terminal,
       ciRetryCount: this.ciRetryCount,
       maxCiRetries,
+      reviewMode,
     };
     const prev = this._lastPublishedUi;
     if (
@@ -382,7 +384,8 @@ export default class Orca extends View {
       prev.spaceId === next.spaceId &&
       prev.terminal === next.terminal &&
       prev.ciRetryCount === next.ciRetryCount &&
-      prev.maxCiRetries === next.maxCiRetries
+      prev.maxCiRetries === next.maxCiRetries &&
+      prev.reviewMode === next.reviewMode
     ) {
       return;
     }
@@ -852,6 +855,7 @@ export default class Orca extends View {
     if (this.settings.reviewMode === nextMode) return;
     this.settings = { ...this.settings, reviewMode: nextMode };
     setShared(STORAGE_SETTINGS, this.settings);
+    this.publishUiState();
     this.addLog(
       "info",
       nextMode === "reviewer"

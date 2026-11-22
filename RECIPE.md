@@ -1,11 +1,12 @@
 # Orca
 
-A backlog orchestrator layout and mod bundle for Herdr (`layouts/main-orca.json`, `mods/orca/`, `mods/tabs-orca/`) that watches a live coding-agent terminal session, classifies turn completion via an OpenAI-compatible endpoint, polls GitHub CI/CD every 5 minutes with bounded auto-fix retries, and advances through `backlog/*.md` tasks automatically.
+A backlog orchestrator layout and mod bundle for Herdr (`layouts/main-orca.json`, `mods/orca/`, `mods/tabs-orca/`, `mods/agents-orca/`) that watches a live coding-agent terminal session, classifies turn completion via an OpenAI-compatible endpoint, polls GitHub CI/CD every 5 minutes with bounded auto-fix retries, and advances through `backlog/*.md` tasks automatically.
 
 ![Orca](preview.png)
 
 ## What you see
 
+- **Left agents sidebar (`mods/agents-orca/`):** identical to shipped `agents`, except when `shared("orca.ui")` is active (`watching`, `classifying`, `waiting_ci`, `fixing_ci`, `advancing`) on an `idle`/`done` agent, it moves into a **`Waiting`** section and shows a pulsing **`Waiting`** badge instead of `Idle`.
 - **Top tab bar (`mods/tabs-orca/`):** identical to shipped `tabs`, with an **Orca** toggle button right after `Changes` showing upright `mods/orca/icons/orca.svg` (plus a spinning `spinner.svg` in `accent` while active, pulsing `working` dot while waiting for CI, `blocked` dot when paused or errored).
 - **Right-hand Orca panel (`368px` default in `panel-body` stack):**
   - **Header (`chrome`):** upright Orca icon, animated status badge (`Ожидание`, `Наблюдение`, `Классификация`, `Ожидание CI`, `Фикс CI`, `Следующая задача`, `Пауза`, `Ошибка`), and `Старт` / `Продолжить` / `Пауза` / `Пропустить` / `Стоп` controls.
@@ -23,8 +24,8 @@ A backlog orchestrator layout and mod bundle for Herdr (`layouts/main-orca.json`
 
 ## Built from
 
-- **Layout:** `layouts/main-orca.json` (cloned from `main`, using `tabs-orca` and adding `orca` to `panel-body`).
-- **Mods:** `mods/tabs-orca/` (cloned from `tabs`) and `mods/orca/` (`mod.json`, `main.js`, `ui.js`, `parser.js`, `paths.js`, `classifier.js`, `reviewer_tools.js`, `ci.js`, `guards.js`, and 16 monochrome SVGs in `mods/orca/icons/`).
+- **Layout:** `layouts/main-orca.json` (cloned from `main`, using `tabs-orca`, `agents-orca`, and adding `orca` to `panel-body`).
+- **Mods:** `mods/tabs-orca/` (cloned from `tabs`), `mods/agents-orca/` (cloned from `agents`), and `mods/orca/` (`mod.json`, `main.js`, `ui.js`, `parser.js`, `paths.js`, `classifier.js`, `reviewer_tools.js`, `ci.js`, `guards.js`, and 16 monochrome SVGs in `mods/orca/icons/`).
 - **Herdr APIs:** `spaces`, `panes`, `focused`, `agents`, `terminals`, `exec`, `hc`, `home`, `readTextFile`, `writeTextFile`, `watchFolder`, `pickFolder`, `run`, `notify`, `playSound`, `theme`, `nextCommand`, `checking`, `window`, `shared`, `setShared`, `settings`, `props`.
 - **External programs & network:** `fetch` to user-configured OpenAI-compatible `/v1/models` and `/v1/chat/completions`; `gh` CLI (`run list`, `pr checks`, `run view --log-failed`); `git`; `powershell`/`sh` for listing `.md` files.
 
@@ -37,5 +38,5 @@ A backlog orchestrator layout and mod bundle for Herdr (`layouts/main-orca.json`
 ## Done when
 
 - `bun test` passes all 42 unit tests across `tests/*.test.js`.
-- `herdr-app check` passes on both `mods/orca` and `mods/tabs-orca`.
+- `herdr-app check` passes on `mods/orca`, `mods/tabs-orca`, and `mods/agents-orca`.
 - Switching to `main-orca` shows the `Orca` button in the top bar and opens the right-hand Orca panel with zero errors in `herdr-app status`.

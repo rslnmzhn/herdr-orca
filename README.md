@@ -6,8 +6,9 @@
 
 ## Возможности
 
-- **Кнопка и панель в интерфейсе (`main-orca` + `tabs-orca`):**
+- **Кнопка и панель в интерфейсе (`main-orca` + `tabs-orca` + `agents-orca`):**
   - Кнопка **Orca** в верхней панели рядом с `Files` и `Changes` с живой анимацией статуса (спиннер при работе/анализе/фиксе, пульсирующая точка при ожидании CI, индикатор при паузе/ошибке; логотип Orca остаётся ровным).
+  - В левой панели **Agents** (`agents-orca`) вместо `Idle` отображается пульсирующая метка **`Waiting`** (и отдельная секция `Waiting`), пока Orca/ревьювер проверяет или ждёт этого агента.
   - Правая панель продолжает работать в фоне, даже если переключиться на `Files`/`Changes` или скрыть панель.
 - **Очередь из `backlog/*.md`:**
   - Автопоиск `backlog/`, `docs/backlog/`, `.backlog/` в активном `space` (включая корень git-репозитория) или выбор папки вручную.
@@ -38,6 +39,7 @@ git clone https://github.com/rslnmzhn/herdr-orca.git
 ```cmd
 mklink /J "%USERPROFILE%\.config\herdr-app\mods\orca" "<path-to-repo>\herdr-orca\mods\orca"
 mklink /J "%USERPROFILE%\.config\herdr-app\mods\tabs-orca" "<path-to-repo>\herdr-orca\mods\tabs-orca"
+mklink /J "%USERPROFILE%\.config\herdr-app\mods\agents-orca" "<path-to-repo>\herdr-orca\mods\agents-orca"
 copy "<path-to-repo>\herdr-orca\layouts\main-orca.json" "%USERPROFILE%\.config\herdr-app\layouts\main-orca.json"
 ```
 
@@ -46,6 +48,7 @@ copy "<path-to-repo>\herdr-orca\layouts\main-orca.json" "%USERPROFILE%\.config\h
 ```sh
 ln -s /path/to/herdr-orca/mods/orca ~/.config/herdr-app/mods/orca
 ln -s /path/to/herdr-orca/mods/tabs-orca ~/.config/herdr-app/mods/tabs-orca
+ln -s /path/to/herdr-orca/mods/agents-orca ~/.config/herdr-app/mods/agents-orca
 cp /path/to/herdr-orca/layouts/main-orca.json ~/.config/herdr-app/layouts/main-orca.json
 ```
 
@@ -72,4 +75,5 @@ herdr-app do layout.switch '{"name":"main-orca"}'
 bun test
 herdr-app check ~/.config/herdr-app/mods/orca
 herdr-app check ~/.config/herdr-app/mods/tabs-orca
+herdr-app check ~/.config/herdr-app/mods/agents-orca
 ```
