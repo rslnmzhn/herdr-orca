@@ -136,6 +136,10 @@ describe("shouldRetryCi & buildCiFixPrompt", () => {
     expect(prompt).toContain("EPIC-002");
     expect(prompt).toContain("1/∞");
     expect(prompt).toContain("Checks failed");
+    expect(prompt).toContain("[ ] TODO");
+    expect(prompt).toContain("[-] IN PROGRESS");
+    expect(prompt).toContain("[!] BLOCKED");
+    expect(prompt).toContain("[x] DONE");
   });
 });
 

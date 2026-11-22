@@ -155,8 +155,9 @@ export default class Tabs extends View {
           if (on) run("layout.hide", { id: "panel" });
           else { run("layout.select", { stack: "panel-body", child: "orca" }); run("layout.show", { id: "panel" }); }
         })
-        .child(svg("mods/orca/icons/orca.svg").size(14).when(orcaSpinning, el => el.text_color(t.accent).spin(1400)))
+        .child(svg("mods/orca/icons/orca.svg").size(14).when(orcaSpinning || orcaWaitingCi, el => el.text_color(t.accent)))
         .child("Orca")
+        .when(orcaSpinning, el => el.child(svg("mods/orca/icons/spinner.svg").size(12).flex_none().text_color(t.accent).spin(900)))
         .when(orcaWaitingCi, el => el.child(div().size(6).rounded(3).bg(t.working).loop("opacity", { from: 0.35, to: 1, period: 1100 })))
         .when(orcaAlert, el => el.child(div().size(6).rounded(3).bg(t.blocked)));
     };

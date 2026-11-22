@@ -143,4 +143,137 @@ describe("fetchModels & classifySessionTurn", () => {
     ).rejects.toThrow(/429/);
     expect(seenHeaders.Authorization).toBeUndefined();
   });
+
+  test("reviewer mode runs tool-calling inspection loop and returns needs_fix with evidence and issues", async () => {
+    const requests = [];
+    const toolCallsSeen = [];
+    let step = 0;
+    const mockFetch = async (_url, opts) => {
+      const body = JSON.parse(opts.body);
+      requests.push(body);
+      step++;
+      if (step === 1) {
+        return new Response(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  role: "assistant",
+                  content: null,
+                  tool_calls: [
+                    {
+                      id: "call_1",
+                      type: "function",
+                      function: { name: "git_diff", arguments: '{"target":"working"}' },
+                    },
+                  ],
+                },
+              },
+            ],
+          }),
+          { status: 200 },
+        );
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                role: "assistant",
+                content: JSON.stringify({
+                  verdict: "needs_fix",
+                  reason: "Агент оставил заглушку TODO вместо реализации",
+                  evidence: ["git_diff: +// TODO: implement"],
+                  issues: ["Реализовать проверку в src/auth.js"],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+
+    const toolExecutor = async (name, args) => {
+      toolCallsSeen.push({ name, args });
+      return "diff --git a/src/auth.js b/src/auth.js\n+// TODO: implement";
+    };
+
+    const res = await classifySessionTurn(
+      { baseUrl: "https://api.openai.com/v1", apiKey: "sk-test", model: "gpt-4o" },
+      {
+        reviewMode: "reviewer",
+        epic: { id: "EPIC-001", title: "Auth", dod: "Tests pass" },
+        task: { id: "TASK-001.1", title: "Verify token", subitems: [] },
+        terminalTail: "Done!",
+        gitStatus: "M src/auth.js",
+        gitLog: "",
+        gitDiff: "",
+        ciSummary: "",
+      },
+      mockFetch,
+      toolExecutor,
+    );
+
+    expect(requests).toHaveLength(2);
+    expect(Array.isArray(requests[0].tools)).toBe(true);
+    expect(requests[0].max_tokens).toBeGreaterThanOrEqual(800);
+    expect(toolCallsSeen).toEqual([{ name: "git_diff", args: { target: "working" } }]);
+    expect(requests[1].messages.some((m) => m.role === "tool" && m.tool_call_id === "call_1")).toBe(true);
+    expect(res).toEqual({
+      verdict: "needs_fix",
+      reason: "Агент оставил заглушку TODO вместо реализации",
+      evidence: ["git_diff: +// TODO: implement"],
+      issues: ["Реализовать проверку в src/auth.js"],
+    });
+  });
+
+  test("reviewer mode falls back cleanly when endpoint rejects tools with HTTP 400", async () => {
+    const bodies = [];
+    const mockFetch = async (_url, opts) => {
+      const body = JSON.parse(opts.body);
+      bodies.push(body);
+      if (body.tools) {
+        return new Response(JSON.stringify({ error: { message: "tools not supported" } }), { status: 400 });
+      }
+      return new Response(
+        JSON.stringify({
+          choices: [
+            {
+              message: {
+                content: JSON.stringify({
+                  verdict: "completed",
+                  reason: "Дифф и тесты подтверждают выполнение",
+                  evidence: ["34 pass in terminal"],
+                  issues: [],
+                }),
+              },
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    };
+
+    const res = await classifySessionTurn(
+      { baseUrl: "http://localhost:11434/v1", apiKey: "", model: "qwen2.5" },
+      {
+        reviewMode: "reviewer",
+        epic: { id: "EPIC-001", title: "Auth", dod: "" },
+        task: null,
+        terminalTail: "34 pass, 0 fail",
+        gitStatus: "M src/auth.js",
+        gitLog: "abc123 feat: auth",
+        gitDiff: "+export function verify() { return true; }",
+        ciSummary: "",
+      },
+      mockFetch,
+      async () => "unused",
+    );
+
+    expect(bodies.length).toBeGreaterThanOrEqual(2);
+    expect(bodies[bodies.length - 1].tools).toBeUndefined();
+    expect(res.verdict).toBe("completed");
+    expect(res.evidence).toEqual(["34 pass in terminal"]);
+  });
 });

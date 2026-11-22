@@ -211,7 +211,9 @@ export function buildCiFixPrompt(epic, task, ciInfo, logTail, attempt, maxRetrie
     "3. Commit and push your fix so CI re-runs.",
   );
   if (epic?.filePath) {
-    lines.push(`4. Keep backlog status accurate in ${epic.filePath}.`);
+    lines.push(
+      `4. Keep backlog status accurate in ${epic.filePath} using Kanban format: \`[ ] TODO\` (\`- [ ]\`), \`[-] IN PROGRESS\` (\`- [-]\`) while fixing, \`[!] BLOCKED\` (\`- [!]\`) if blocked, \`[x] DONE\` (\`- [x]\`) when completed and verified.`,
+    );
   }
 
   return lines.join("\n");

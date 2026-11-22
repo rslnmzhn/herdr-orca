@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { parseEpicFile, listQueueItems, pickNextQueueItem } from "../mods/orca/parser.js";
+import {
+  parseEpicFile,
+  listQueueItems,
+  pickNextQueueItem,
+  buildAgentPrompt,
+} from "../mods/orca/parser.js";
 
 describe("orca queue selection", () => {
   const epic1 = parseEpicFile(
@@ -59,5 +64,17 @@ describe("orca queue selection", () => {
     expect(listQueueItems(null, "tasks")).toEqual([]);
     expect(pickNextQueueItem([], "tasks")).toBeNull();
     expect(pickNextQueueItem([epic1, epic2], "tasks", "C:/repo/backlog/missing.md")).toBeNull();
+  });
+
+  test("buildAgentPrompt specifies exact Kanban backlog statuses for execution stages", () => {
+    const prompt = buildAgentPrompt(epic1, epic1.tasks[1], "C:/repo");
+    expect(prompt).toContain("[ ] TODO");
+    expect(prompt).toContain("[-] IN PROGRESS");
+    expect(prompt).toContain("[!] BLOCKED");
+    expect(prompt).toContain("[x] DONE");
+    expect(prompt).toContain("- [ ]");
+    expect(prompt).toContain("- [-]");
+    expect(prompt).toContain("- [!]");
+    expect(prompt).toContain("- [x]");
   });
 });

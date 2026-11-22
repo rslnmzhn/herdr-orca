@@ -43,6 +43,7 @@ import {
   buildCiFixPrompt,
 } from "./ci.js";
 import { resolveStartAction, resolveCompletedCiAction } from "./guards.js";
+import { createReviewerToolExecutor, buildReviewFixPrompt } from "./reviewer_tools.js";
 import {
   statusMeta,
   renderHeader,
@@ -63,23 +64,31 @@ const MAX_LOGS = 200;
 
 const remoteHomeCache = new Map();
 
+function parseNonNegativeInt(val, fallback = 3) {
+  if (val === undefined || val === null || val === "") return fallback;
+  const parsed = Number(val);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 function normalizeSettings(raw) {
   const obj = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
   const baseUrl = typeof obj.baseUrl === "string" ? obj.baseUrl.trim() : "";
   const apiKey = typeof obj.apiKey === "string" ? obj.apiKey : "";
   const model = typeof obj.model === "string" ? obj.model.trim() : "";
-  const parsedRetries = Number(obj.maxCiRetries);
-  const maxCiRetries =
-    obj.maxCiRetries !== undefined &&
-    obj.maxCiRetries !== null &&
-    obj.maxCiRetries !== "" &&
-    Number.isInteger(parsedRetries) &&
-    parsedRetries >= 0
-      ? parsedRetries
-      : 3;
+  const maxCiRetries = parseNonNegativeInt(obj.maxCiRetries, 3);
+  const maxReviewRetries = parseNonNegativeInt(obj.maxReviewRetries, 3);
+  const reviewMode = obj.reviewMode === "auto" ? "auto" : "reviewer";
   const parsedPoll = Number(obj.ciPollMinutes);
   const ciPollMinutes = Number.isFinite(parsedPoll) && parsedPoll > 0 ? parsedPoll : 5;
-  return { baseUrl, apiKey, model, maxCiRetries, ciPollMinutes };
+  return {
+    baseUrl,
+    apiKey,
+    model,
+    maxCiRetries,
+    maxReviewRetries,
+    reviewMode,
+    ciPollMinutes,
+  };
 }
 
 function queueItemKey(item) {
@@ -252,6 +261,12 @@ export default class Orca extends View {
     });
     this.maxRetriesInput.on("submit", (_e, cx) => this.saveSettings(cx));
 
+    this.maxReviewRetriesInput = InputState.new({
+      placeholder: "3",
+      value: String(this.settings.maxReviewRetries),
+    });
+    this.maxReviewRetriesInput.on("submit", (_e, cx) => this.saveSettings(cx));
+
     this.selectedTerminal = null;
     this.sessionPickerOpen = false;
 
@@ -259,6 +274,8 @@ export default class Orca extends View {
     this.currentItem = null;
     this.skippedKeys = new Set();
     this.ciRetryCount = 0;
+    this.reviewRetryCount = 0;
+    this.reviewProgress = null;
     this.ciInfo = null;
     this.nextCiCheckAt = null;
     this.ciChecking = false;
@@ -830,6 +847,20 @@ export default class Orca extends View {
     cx.notify();
   }
 
+  setReviewMode(mode, cx) {
+    const nextMode = mode === "auto" ? "auto" : "reviewer";
+    if (this.settings.reviewMode === nextMode) return;
+    this.settings = { ...this.settings, reviewMode: nextMode };
+    setShared(STORAGE_SETTINGS, this.settings);
+    this.addLog(
+      "info",
+      nextMode === "reviewer"
+        ? "Включён режим Ревьювер (проверка кода, diff и тестов)"
+        : "Включён режим Авто (быстрая отправка задач)",
+    );
+    cx.notify();
+  }
+
   getQueueItems() {
     return listQueueItems(this.epics, this.mode);
   }
@@ -868,6 +899,7 @@ export default class Orca extends View {
       this.apiKeyInput.set_value(this.settings.apiKey || "");
       this.modelInput.set_value(this.settings.model || "");
       this.maxRetriesInput.set_value(String(this.settings.maxCiRetries ?? 3));
+      this.maxReviewRetriesInput.set_value(String(this.settings.maxReviewRetries ?? 3));
       this.modelsError = null;
     } else {
       this.handle.focus();
@@ -950,6 +982,23 @@ export default class Orca extends View {
       maxCiRetries = parsed;
     }
 
+    const rawReviewRetries = this.maxReviewRetriesInput.value().trim();
+    let maxReviewRetries = 3;
+    if (rawReviewRetries !== "") {
+      const parsed = Number(rawReviewRetries);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        this.modelsError = "Попыток ревью должно быть целым числом >= 0";
+        notify({
+          title: "Некорректный лимит попыток ревью",
+          body: "Введите целое число >= 0 (0 = бесконечно)",
+          level: "warning",
+        });
+        cx.notify();
+        return;
+      }
+      maxReviewRetries = parsed;
+    }
+
     const model = this.modelInput.value().trim();
     const apiKey = this.apiKeyInput.value();
 
@@ -959,9 +1008,11 @@ export default class Orca extends View {
       apiKey,
       model,
       maxCiRetries,
+      maxReviewRetries,
     };
     this.baseUrlInput.set_value(normalizedUrl);
     this.maxRetriesInput.set_value(String(maxCiRetries));
+    this.maxReviewRetriesInput.set_value(String(maxReviewRetries));
     setShared(STORAGE_SETTINGS, this.settings);
     this.modelsError = null;
     this.settingsOpen = false;
@@ -1105,6 +1156,8 @@ export default class Orca extends View {
     };
     this.currentItem = chosen;
     this.ciRetryCount = 0;
+    this.reviewRetryCount = 0;
+    this.reviewProgress = null;
     this.ciInfo = null;
     this.nextCiCheckAt = null;
     this.lastVerdict = null;
@@ -1145,6 +1198,10 @@ export default class Orca extends View {
 
     cx.spawn(async (cx) => {
       try {
+        await this.markItemStatusOnDisk(item, "in_progress", runCtx.on).catch(() => {});
+        await this.reloadEpicsForDir(runCtx.backlogDir, runCtx.on).catch(() => {});
+        if (this.runSeq !== seq) return;
+
         const res = await hc(["send", runCtx.terminal, prompt]).catch((e) => ({
           code: 1,
           stderr: String(e),
@@ -1226,6 +1283,8 @@ export default class Orca extends View {
     this.currentItem = null;
     this.skippedKeys.clear();
     this.ciRetryCount = 0;
+    this.reviewRetryCount = 0;
+    this.reviewProgress = null;
     this.ciInfo = null;
     this.nextCiCheckAt = null;
     this.lastVerdict = null;
@@ -1252,6 +1311,8 @@ export default class Orca extends View {
     this.addLog("warn", `Пропущена задача ${label}`);
 
     this.ciRetryCount = 0;
+    this.reviewRetryCount = 0;
+    this.reviewProgress = null;
     this.ciInfo = null;
     this.nextCiCheckAt = null;
     this.lastVerdict = null;
@@ -1348,15 +1409,27 @@ export default class Orca extends View {
     const item = this.currentItem;
     if (!runCtx || !item) return;
 
+    const isReviewer = (this.settings?.reviewMode ?? "reviewer") === "reviewer";
     const seq = ++this.runSeq;
+    this.reviewProgress = isReviewer ? "Сбор фактов…" : null;
     this.setState("classifying");
     this.statusReason = null;
-    this.addLog("info", "Классификация завершения хода агента…");
+    this.addLog(
+      "info",
+      isReviewer
+        ? "Ревьювер проверяет работу агента…"
+        : "Классификация завершения хода агента…",
+    );
     cx.notify();
 
     cx.spawn(async (cx) => {
       try {
-        const readRes = await hc(["read", runCtx.terminal, "--lines", "120"]).catch((e) => ({
+        const readRes = await hc([
+          "read",
+          runCtx.terminal,
+          "--lines",
+          isReviewer ? "200" : "120",
+        ]).catch((e) => ({
           code: 1,
           stdout: "",
           stderr: String(e),
@@ -1366,13 +1439,14 @@ export default class Orca extends View {
 
         let gitStatus = "";
         let gitLog = "";
+        let gitDiff = "";
         if (runCtx.projectRoot) {
           const [stRes, logRes] = await Promise.all([
             exec("git", ["status", "--short"], {
               cwd: runCtx.projectRoot,
               on: runCtx.on,
             }).catch(() => null),
-            exec("git", ["log", "-1", "--oneline"], {
+            exec("git", ["log", isReviewer ? "-5" : "-1", "--oneline"], {
               cwd: runCtx.projectRoot,
               on: runCtx.on,
             }).catch(() => null),
@@ -1380,6 +1454,33 @@ export default class Orca extends View {
           if (this.runSeq !== seq) return;
           if (stRes?.code === 0) gitStatus = stRes.stdout.trim();
           if (logRes?.code === 0) gitLog = logRes.stdout.trim();
+
+          if (isReviewer) {
+            const [unstagedRes, stagedRes] = await Promise.all([
+              exec("git", ["diff"], { cwd: runCtx.projectRoot, on: runCtx.on }).catch(() => null),
+              exec("git", ["diff", "--cached"], { cwd: runCtx.projectRoot, on: runCtx.on }).catch(
+                () => null,
+              ),
+            ]);
+            if (this.runSeq !== seq) return;
+            const diffParts = [];
+            if (unstagedRes?.code === 0 && unstagedRes.stdout?.trim()) {
+              diffParts.push(unstagedRes.stdout.trim());
+            }
+            if (stagedRes?.code === 0 && stagedRes.stdout?.trim()) {
+              diffParts.push(`# Staged\n${stagedRes.stdout.trim()}`);
+            }
+            if (diffParts.length > 0) {
+              gitDiff = diffParts.join("\n\n");
+            } else {
+              const showRes = await exec("git", ["show", "--stat", "--patch", "-n", "1", "HEAD"], {
+                cwd: runCtx.projectRoot,
+                on: runCtx.on,
+              }).catch(() => null);
+              if (this.runSeq !== seq) return;
+              if (showRes?.code === 0) gitDiff = showRes.stdout.trim();
+            }
+          }
         }
 
         let ci = {
@@ -1400,18 +1501,51 @@ export default class Orca extends View {
           this.ciInfo = ci;
         }
 
-        const verdict = await classifySessionTurn(this.settings, {
-          epic: item.epic,
-          task: item.task,
-          terminalTail,
-          gitStatus,
-          gitLog,
-          ciSummary,
-        });
+        const toolExecutor = isReviewer
+          ? createReviewerToolExecutor({
+              projectRoot: runCtx.projectRoot,
+              terminal: runCtx.terminal,
+              on: runCtx.on,
+              epicFilePath: item.epic?.filePath ?? null,
+              execFn: exec,
+              hcFn: hc,
+              readTextFileFn: readTextFile,
+            })
+          : null;
+
+        const onProgress = isReviewer
+          ? (stepText) => {
+              if (this.runSeq !== seq) return;
+              this.reviewProgress = stepText;
+              this.addLog("info", `Ревьювер: ${stepText}`);
+              cx.notify();
+            }
+          : null;
+
+        const verdict = await classifySessionTurn(
+          this.settings,
+          {
+            reviewMode: isReviewer ? "reviewer" : "auto",
+            epic: item.epic,
+            task: item.task,
+            terminalTail,
+            gitStatus,
+            gitLog,
+            gitDiff,
+            ciSummary,
+          },
+          fetch,
+          toolExecutor,
+          onProgress,
+        );
         if (this.runSeq !== seq) return;
 
+        this.reviewProgress = null;
         this.lastVerdict = verdict;
         this.addLog("info", `Вердикт: ${verdict.verdict} — ${verdict.reason}`);
+        if (Array.isArray(verdict.evidence) && verdict.evidence.length > 0) {
+          this.addLog("info", `Факты: ${verdict.evidence.slice(0, 3).join(" | ")}`);
+        }
 
         if (verdict.verdict === "completed") {
           const ciAction = resolveCompletedCiAction(ci.state);
@@ -1426,6 +1560,11 @@ export default class Orca extends View {
             return;
           }
           await this.markDoneAndAdvance(seq, cx);
+          return;
+        }
+
+        if (verdict.verdict === "needs_fix") {
+          await this.handleReviewFailure(runCtx, item, verdict, seq, cx);
           return;
         }
 
@@ -1463,10 +1602,81 @@ export default class Orca extends View {
         cx.notify();
       } catch (err) {
         if (this.runSeq !== seq) return;
+        this.reviewProgress = null;
         const msg = String(err?.message ?? err);
         this.failRun(`Ошибка классификации: ${msg}`, cx);
       }
     });
+  }
+
+  async handleReviewFailure(runCtx, item, verdict, seq, cx) {
+    const maxRetries = this.settings?.maxReviewRetries ?? 3;
+    const issues = Array.isArray(verdict?.issues) ? verdict.issues.filter(Boolean) : [];
+    const summary = issues[0] || verdict?.reason || "Ревьювер отклонил выполнение";
+
+    if (shouldRetryCi(this.reviewRetryCount, maxRetries)) {
+      this.reviewRetryCount += 1;
+      this.sendingPrompt = true;
+      this.setState("advancing");
+      this.statusReason = `Ревью: возврат на доработку (${summary})`;
+      const maxLabel = maxRetries === 0 ? "∞" : String(maxRetries);
+      this.addLog(
+        "warn",
+        `Ревью отклонено (попытка ${this.reviewRetryCount}/${maxLabel}): ${summary}`,
+      );
+      cx.notify();
+
+      try {
+        const fixPrompt = buildReviewFixPrompt(
+          item.epic,
+          item.task,
+          verdict,
+          this.reviewRetryCount,
+          maxRetries,
+        );
+        const sendRes = await hc(["send", runCtx.terminal, fixPrompt]).catch((e) => ({
+          code: 1,
+          stderr: String(e),
+        }));
+        if (this.runSeq !== seq) return;
+
+        if (sendRes.code !== 0) {
+          this.sendingPrompt = false;
+          this.failRun(
+            `Не удалось отправить замечания ревью в ${runCtx.terminal}: ${sendRes.stderr || "ошибка hc send"}`,
+            cx,
+          );
+          return;
+        }
+
+        this.sentAt = Date.now();
+        this.lastAgentStatus = this.readTerminalAgentStatus(runCtx.terminal);
+        this.sawWorkingSinceSend = this.lastAgentStatus === "working";
+        this.idleSince = null;
+        this.sendingPrompt = false;
+        this.setState("watching");
+        this.addLog("info", `Отправлены замечания ревью (попытка ${this.reviewRetryCount})`);
+        cx.notify();
+      } finally {
+        if (this.runSeq === seq) {
+          this.sendingPrompt = false;
+        }
+      }
+      return;
+    }
+
+    this.runSeq++;
+    this.setState("error");
+    this.statusReason = `Исчерпан лимит попыток ревью (${maxRetries}): ${summary}`;
+    this.addLog("error", this.statusReason);
+    notify({
+      title: "Orca: ревью не пройдено",
+      body: this.statusReason,
+      level: "error",
+      action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
+    });
+    playSound("blocked");
+    cx.notify();
   }
 
   enterWaitingCi(reason, cx) {
@@ -1647,12 +1857,12 @@ export default class Orca extends View {
     cx.notify();
   }
 
-  async markItemDoneOnDisk(item, on) {
+  async markItemStatusOnDisk(item, status, on) {
     const epic = item.epic;
     const task = item.task;
     const nextText = task
-      ? updateTaskStatus(epic.rawText, task.lineIndex, "done")
-      : updateEpicStatus(epic.rawText, "done");
+      ? updateTaskStatus(epic.rawText, task.lineIndex, status)
+      : updateEpicStatus(epic.rawText, status);
 
     if (nextText === epic.rawText) return;
 
@@ -1674,11 +1884,15 @@ export default class Orca extends View {
         if (!freshTask) return;
       }
       const retryText = freshTask
-        ? updateTaskStatus(freshRaw, freshTask.lineIndex, "done")
-        : updateEpicStatus(freshRaw, "done");
+        ? updateTaskStatus(freshRaw, freshTask.lineIndex, status)
+        : updateEpicStatus(freshRaw, status);
       if (retryText === freshRaw) return;
       await writeTextFile(epic.filePath, retryText, freshRaw);
     }
+  }
+
+  async markItemDoneOnDisk(item, on) {
+    return this.markItemStatusOnDisk(item, "done", on);
   }
 
   async markDoneAndAdvance(seq, cx) {
@@ -1699,6 +1913,8 @@ export default class Orca extends View {
     if (this.runSeq !== seq) return;
 
     this.ciRetryCount = 0;
+    this.reviewRetryCount = 0;
+    this.reviewProgress = null;
     this.ciInfo = null;
     this.nextCiCheckAt = null;
     this.lastVerdict = null;
@@ -1712,7 +1928,12 @@ export default class Orca extends View {
 
     this.currentItem = next;
     const nextLabel = next.task ? `${next.epic.id} · ${next.task.id}` : next.epic.id;
-    const prompt = buildAgentPrompt(next.epic, next.task, runCtx.projectRoot);
+    await this.markItemStatusOnDisk(next, "in_progress", runCtx.on).catch(() => {});
+    await this.reloadEpicsForDir(runCtx.backlogDir, runCtx.on).catch(() => {});
+    if (this.runSeq !== seq) return;
+
+    const activeNext = this.currentItem ?? next;
+    const prompt = buildAgentPrompt(activeNext.epic, activeNext.task, runCtx.projectRoot);
     const sendRes = await hc(["send", runCtx.terminal, prompt]).catch((e) => ({
       code: 1,
       stderr: String(e),
@@ -1743,6 +1964,8 @@ export default class Orca extends View {
     this.currentItem = null;
     this.skippedKeys.clear();
     this.ciRetryCount = 0;
+    this.reviewRetryCount = 0;
+    this.reviewProgress = null;
     this.ciInfo = null;
     this.nextCiCheckAt = null;
     this.lastVerdict = null;

@@ -284,8 +284,7 @@ export function renderHeader(view, t) {
             .size(16)
             .flex_none()
             .text_color(isActive ? meta.color : t.accent)
-            .when(isSpinning, (el) => el.spin(1400))
-            .when(isWaitingCi, (el) => el.loop("opacity", { from: 0.35, to: 1, period: 1100 })),
+            .when(isActive, (el) => el.loop("opacity", { from: 0.55, to: 1, period: 1200 })),
         )
         .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child("Orca"))
         .child(
@@ -448,8 +447,43 @@ export function renderSessionAndBacklog(view, t) {
         .child(div().flex_1())
         .child(
           h_flex()
+            .flex_wrap()
             .gap(4)
             .items_center()
+            .child(
+              pillButton(
+                "orca-review-auto",
+                "Авто",
+                (view.settings?.reviewMode ?? "reviewer") === "auto",
+                (_e, cx) => view.setReviewMode("auto", cx),
+                t,
+                {
+                  height: 24,
+                  px: 8,
+                  textSize: 11,
+                  tip: "Режим Авто: быстрая проверка завершения хода и отправка следующей задачи",
+                },
+              ),
+            )
+            .child(
+              pillButton(
+                "orca-review-reviewer",
+                "Ревьювер",
+                (view.settings?.reviewMode ?? "reviewer") === "reviewer",
+                (_e, cx) => view.setReviewMode("reviewer", cx),
+                t,
+                {
+                  height: 24,
+                  px: 8,
+                  textSize: 11,
+                  activeFg: t.accent,
+                  activeBg: alpha(t.accent, "20"),
+                  activeBorder: alpha(t.accent, "66"),
+                  tip: "Режим Ревьювер: проверяет diff, файлы и тесты через инструменты и возвращает на доработку при фальсификации",
+                },
+              ),
+            )
+            .child(div().w(1).h(14).mx(2).bg(t.border))
             .child(
               pillButton(
                 "orca-mode-tasks",
@@ -625,6 +659,10 @@ export function renderPipelineStrip(view, t) {
   const maxRetries = view.settings?.maxCiRetries ?? 3;
   const retryLimitLabel = maxRetries === 0 ? "∞" : String(maxRetries);
   const retryCount = view.ciRetryCount ?? 0;
+  const isReviewerMode = (view.settings?.reviewMode ?? "reviewer") === "reviewer";
+  const maxReviewRetries = view.settings?.maxReviewRetries ?? 3;
+  const reviewLimitLabel = maxReviewRetries === 0 ? "∞" : String(maxReviewRetries);
+  const reviewRetryCount = view.reviewRetryCount ?? 0;
   const showCiRow = state === "waiting_ci" || state === "fixing_ci" || Boolean(view.ciInfo);
 
   return v_flex()
@@ -649,10 +687,16 @@ export function renderPipelineStrip(view, t) {
         )
         .child(svg("mods/orca/icons/chevron-right.svg").size(11).flex_none().text_color(t.dim))
         .child(
-          renderPipelineStage("orca-stage-classifier", "Классификатор", stage2, t, {
-            color: meta.color,
-            spinning: state === "classifying",
-          }),
+          renderPipelineStage(
+            "orca-stage-classifier",
+            isReviewerMode ? "Ревьювер" : "Классификатор",
+            stage2,
+            t,
+            {
+              color: meta.color,
+              spinning: state === "classifying",
+            },
+          ),
         )
         .child(svg("mods/orca/icons/chevron-right.svg").size(11).flex_none().text_color(t.dim))
         .child(
@@ -660,6 +704,24 @@ export function renderPipelineStrip(view, t) {
             color: meta.color,
             spinning: state === "advancing",
           }),
+        )
+        .when(state === "classifying" && Boolean(view.reviewProgress), (el) =>
+          el.child(
+            badge(
+              view.reviewProgress,
+              t.ansi5 ?? t.accent,
+              alpha(t.ansi5 ?? t.accent, "1e"),
+            ),
+          ),
+        )
+        .when(reviewRetryCount > 0, (el) =>
+          el.child(
+            badge(
+              `Ревью ${reviewRetryCount}/${reviewLimitLabel}`,
+              t.working ?? t.ansi3,
+              alpha(t.working ?? t.ansi3, "20"),
+            ),
+          ),
         )
         .when(Boolean(view.lastVerdict), (el) =>
           el.child(
@@ -670,8 +732,8 @@ export function renderPipelineStrip(view, t) {
               .child(
                 badge(
                   String(view.lastVerdict.verdict || "").toUpperCase(),
-                  t.accent,
-                  alpha(t.accent, "1e"),
+                  view.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent,
+                  alpha(view.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent, "1e"),
                 ),
               )
               .when(Boolean(view.lastVerdict.reason), (r) =>
@@ -1186,10 +1248,17 @@ export function renderFooterAndSettings(view, t) {
                   )
                   .child(
                     v_flex()
-                      .w(150)
+                      .w(135)
                       .gap(4)
                       .child(div().text_size(11).font_medium().text_color(t.muted).child("Попыток фикса CI"))
                       .child(renderInputBox("orca-input-retries", view.maxRetriesInput, t)),
+                  )
+                  .child(
+                    v_flex()
+                      .w(135)
+                      .gap(4)
+                      .child(div().text_size(11).font_medium().text_color(t.muted).child("Попыток ревью"))
+                      .child(renderInputBox("orca-input-review-retries", view.maxReviewRetriesInput, t)),
                   ),
               )
               .child(
@@ -1298,6 +1367,15 @@ export function renderFooterAndSettings(view, t) {
             (_e, cx) => view.toggleSettings(cx),
             t,
             { icon: "settings", height: 24, px: 8, textSize: 11.5 },
+          ),
+        )
+        .child(
+          badge(
+            (view.settings?.reviewMode ?? "reviewer") === "reviewer" ? "Ревьювер" : "Авто",
+            (view.settings?.reviewMode ?? "reviewer") === "reviewer" ? (t.ansi5 ?? t.accent) : t.muted,
+            (view.settings?.reviewMode ?? "reviewer") === "reviewer"
+              ? alpha(t.ansi5 ?? t.accent, "1c")
+              : t.raised,
           ),
         )
         .child(badge(activeModel, t.accent, alpha(t.accent, "1c")))
