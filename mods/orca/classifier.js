@@ -4,9 +4,162 @@
 import { REVIEWER_TOOLS } from "./reviewer_tools.js";
 
 const VALID_VERDICTS = new Set(["completed", "waiting_ci", "needs_fix", "needs_user", "failed"]);
+const VALID_CHECK_STATUSES = new Set(["pass", "partial", "fail", "na"]);
 const MAX_REVIEW_TOOL_ROUNDS = 6;
 const DEFAULT_RETRY_DELAYS_MS = [3000, 5000, 10000, 15000, 30000];
 const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
+
+export const DEFAULT_MIN_REVIEW_SCORE = 15;
+
+export const BLOCKING_REVIEW_CHECKS = [
+  {
+    id: "requirements_met",
+    label: "Требования задачи / DoD выполнены",
+    promptRule:
+      "All assigned task/epic requirements, subitems, DoD, or claims in the agent's turn are genuinely implemented.",
+  },
+  {
+    id: "no_stubs",
+    label: "Нет заглушек (TODO / фейков)",
+    promptRule:
+      "No TODO, FIXME, NotImplemented, empty handlers, or hardcoded fake returns.",
+  },
+  {
+    id: "logic_edge_cases",
+    label: "Логика и граничные случаи верны",
+    promptRule:
+      "Core logic and edge cases (null/empty/bounds/state transitions) are sound with no obvious bugs or regressions.",
+  },
+  {
+    id: "security_safety",
+    label: "Безопасность и сохранность данных",
+    promptRule:
+      "No hardcoded secrets, injection risks, path traversal, race conditions, or data loss.",
+  },
+  {
+    id: "no_test_cheating",
+    label: "Нет читерства с тестами",
+    promptRule:
+      "No skipped/disabled tests (test.skip, xit), deleted assertions, or tests rigged to pass on broken code.",
+  },
+  {
+    id: "checks_passed",
+    label: "Проверки затронутого слоя не падают",
+    promptRule:
+      "Relevant checks/tests for the modified layer pass (do NOT fail just because earlier unrelated steps scrolled past the 400-line terminal tail if no failure is observed).",
+  },
+];
+
+export const OPTIONAL_REVIEW_CHECKS = [
+  {
+    id: "integration_wired",
+    weight: 7,
+    defaultEnabled: true,
+    label: "Код подключён к точкам вызова",
+    promptRule:
+      "New code is actually wired into callers, UI, routes, or exports (not dead/unused code).",
+  },
+  {
+    id: "error_handling",
+    weight: 8,
+    defaultEnabled: true,
+    label: "Корректная обработка ошибок",
+    promptRule:
+      "Errors are propagated or handled explicitly without silent swallowing or broken state.",
+  },
+  {
+    id: "tests_exist_and_meaningful",
+    weight: 6,
+    defaultEnabled: true,
+    label: "Есть осмысленные тесты",
+    promptRule:
+      "Meaningful tests/checks cover the new or changed behavior (not trivial assertions).",
+  },
+  {
+    id: "modularity_no_god_object",
+    weight: 6,
+    defaultEnabled: false,
+    label: "Без God-class / монолитов",
+    promptRule:
+      "Changes stay modular without creating a God-class, God-service, or bloated monolithic function.",
+  },
+  {
+    id: "no_duplication_or_bloat",
+    weight: 5,
+    defaultEnabled: false,
+    label: "Без копипасты и лишнего кода",
+    promptRule:
+      "No copy-paste duplication, speculative abstractions, or unrelated refactoring outside task scope.",
+  },
+  {
+    id: "readability_conventions",
+    weight: 4,
+    defaultEnabled: false,
+    label: "Читаемость и стиль проекта",
+    promptRule:
+      "Clear naming, follows project conventions, no commented-out dead code.",
+  },
+  {
+    id: "clean_diff_and_logs",
+    weight: 5,
+    defaultEnabled: false,
+    label: "Чистый diff и логи",
+    promptRule:
+      "Clean diff with no debug leftovers, duplicate warning/error logs, or stray temporary files.",
+  },
+  {
+    id: "repo_and_backlog_state",
+    weight: 5,
+    defaultEnabled: false,
+    label: "Консистентный git и бэклог",
+    promptRule:
+      "git status is consistent and backlog/*.md status matches Kanban format when working on a backlog item.",
+  },
+];
+
+const BLOCKING_CHECK_MAP = new Map(BLOCKING_REVIEW_CHECKS.map((c) => [c.id, c]));
+const OPTIONAL_CHECK_MAP = new Map(OPTIONAL_REVIEW_CHECKS.map((c) => [c.id, c]));
+
+export function getDefaultOptionalReviewChecks() {
+  return OPTIONAL_REVIEW_CHECKS.filter((c) => c.defaultEnabled).map((c) => c.id);
+}
+
+export function normalizeOptionalReviewChecks(raw) {
+  if (!Array.isArray(raw)) {
+    return getDefaultOptionalReviewChecks();
+  }
+  const seen = new Set();
+  const out = [];
+  for (const id of raw) {
+    if (typeof id === "string" && OPTIONAL_CHECK_MAP.has(id) && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+export function getMaxOptionalReviewScore(enabledIds) {
+  const normalized = normalizeOptionalReviewChecks(enabledIds);
+  let total = 0;
+  for (const id of normalized) {
+    total += OPTIONAL_CHECK_MAP.get(id)?.weight ?? 0;
+  }
+  return total;
+}
+
+export function resolveMinReviewScore(rawValue, enabledIds) {
+  const maxScore = getMaxOptionalReviewScore(enabledIds);
+  if (maxScore <= 0) return 0;
+  if (rawValue === undefined || rawValue === null || String(rawValue).trim() === "") {
+    return Math.min(DEFAULT_MIN_REVIEW_SCORE, maxScore);
+  }
+  const parsed = Number(String(rawValue).trim());
+  if (!Number.isFinite(parsed)) {
+    return Math.min(DEFAULT_MIN_REVIEW_SCORE, maxScore);
+  }
+  return Math.max(0, Math.min(Math.floor(parsed), maxScore));
+}
 
 const ANSI_OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
 const ANSI_CSI_RE = /[\u001b\u009b]\[[0-?]*[ -/]*[@-~]/g;
@@ -137,7 +290,127 @@ export function tryParseJsonObject(text) {
   return null;
 }
 
-export function parseClassifierVerdict(rawText) {
+function normalizeCheckStatus(raw) {
+  const val = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (val === "pass" || val === "passed" || val === "ok") return "pass";
+  if (val === "partial" || val === "warn") return "partial";
+  if (val === "fail" || val === "failed") return "fail";
+  if (val === "na" || val === "n/a") return "na";
+  return null;
+}
+
+function parseCheckEntry(rawEntry) {
+  if (typeof rawEntry === "string") {
+    return { status: normalizeCheckStatus(rawEntry), note: "" };
+  }
+  if (rawEntry && typeof rawEntry === "object" && !Array.isArray(rawEntry)) {
+    return {
+      status: normalizeCheckStatus(rawEntry.status),
+      note: typeof rawEntry.note === "string" ? rawEntry.note.trim() : "",
+    };
+  }
+  return { status: null, note: "" };
+}
+
+export function evaluateReviewRubric(rawChecks, reviewConfig = {}) {
+  const enabledOptionalIds = normalizeOptionalReviewChecks(reviewConfig?.optionalChecks);
+  const enabledSet = new Set(enabledOptionalIds);
+  const selectedMax = getMaxOptionalReviewScore(enabledOptionalIds);
+  const minScore = resolveMinReviewScore(reviewConfig?.minReviewScore, enabledOptionalIds);
+  const checksObj = rawChecks && typeof rawChecks === "object" && !Array.isArray(rawChecks) ? rawChecks : {};
+
+  const checks = {};
+  const failedBlocking = [];
+  const failedOptional = [];
+  const partialOptional = [];
+
+  for (const def of BLOCKING_REVIEW_CHECKS) {
+    const parsed = parseCheckEntry(checksObj[def.id]);
+    const status = parsed.status ?? "na";
+    checks[def.id] = {
+      id: def.id,
+      label: def.label,
+      blocking: true,
+      weight: 0,
+      status,
+      note: parsed.note,
+    };
+    if (status === "fail" || status === "partial") {
+      failedBlocking.push({
+        id: def.id,
+        label: def.label,
+        status,
+        note: parsed.note,
+      });
+    }
+  }
+
+  let earned = 0;
+  let applicableMax = 0;
+
+  for (const def of OPTIONAL_REVIEW_CHECKS) {
+    if (!enabledSet.has(def.id)) continue;
+    const parsed = parseCheckEntry(checksObj[def.id]);
+    const status = parsed.status ?? "fail";
+    checks[def.id] = {
+      id: def.id,
+      label: def.label,
+      blocking: false,
+      weight: def.weight,
+      status,
+      note: parsed.note,
+    };
+    if (status === "na") continue;
+    applicableMax += def.weight;
+    if (status === "pass") {
+      earned += def.weight;
+    } else if (status === "partial") {
+      earned += def.weight * 0.5;
+      partialOptional.push({
+        id: def.id,
+        label: def.label,
+        weight: def.weight,
+        note: parsed.note,
+      });
+    } else {
+      failedOptional.push({
+        id: def.id,
+        label: def.label,
+        weight: def.weight,
+        note: parsed.note,
+      });
+    }
+  }
+
+  const earnedRounded = Number.isInteger(earned) ? earned : Number(earned.toFixed(1));
+  const effectiveThreshold =
+    selectedMax <= 0 || applicableMax <= 0
+      ? 0
+      : applicableMax === selectedMax
+        ? minScore
+        : Math.round((minScore * applicableMax) / selectedMax);
+
+  const blockingPassed = failedBlocking.length === 0;
+  const scorePassed = applicableMax <= 0 || earnedRounded >= effectiveThreshold;
+  const passed = blockingPassed && scorePassed;
+
+  return {
+    passed,
+    blockingPassed,
+    scorePassed,
+    earned: earnedRounded,
+    applicableMax,
+    selectedMax,
+    minScore,
+    effectiveThreshold,
+    failedBlocking,
+    failedOptional,
+    partialOptional,
+    checks,
+  };
+}
+
+export function parseClassifierVerdict(rawText, reviewConfig = null) {
   const text = String(rawText ?? "").trim();
   const obj = tryParseJsonObject(text);
   if (!obj) {
@@ -147,14 +420,25 @@ export function parseClassifierVerdict(rawText) {
     };
   }
 
+  const rawState = typeof obj.state === "string" ? obj.state.trim().toLowerCase() : "";
   const rawVerdict = typeof obj.verdict === "string" ? obj.verdict.trim().toLowerCase() : "";
-  const verdict = VALID_VERDICTS.has(rawVerdict) ? rawVerdict : "needs_user";
+  const processState =
+    rawState === "waiting_ci" || rawState === "needs_user" || rawState === "failed"
+      ? rawState
+      : rawVerdict === "waiting_ci" || rawVerdict === "needs_user" || rawVerdict === "failed"
+        ? rawVerdict
+        : null;
+
   const reason =
     typeof obj.reason === "string" && obj.reason.trim()
       ? obj.reason.trim()
       : "Классификатор не указал причину";
 
-  const result = { verdict, reason };
+  const result = {
+    verdict: processState ?? (VALID_VERDICTS.has(rawVerdict) ? rawVerdict : "needs_user"),
+    reason,
+  };
+
   if (typeof obj.ci_ref === "string" && obj.ci_ref.trim()) {
     result.ci_ref = obj.ci_ref.trim();
   }
@@ -168,6 +452,33 @@ export function parseClassifierVerdict(rawText) {
       .map((item) => (typeof item === "string" ? item.trim() : ""))
       .filter(Boolean);
   }
+
+  if (!processState && obj.checks && typeof obj.checks === "object" && !Array.isArray(obj.checks)) {
+    const hasKnownCheck = Object.keys(obj.checks).some(
+      (k) => BLOCKING_CHECK_MAP.has(k) || OPTIONAL_CHECK_MAP.has(k),
+    );
+    if (hasKnownCheck) {
+      const rubric = evaluateReviewRubric(obj.checks, reviewConfig ?? {});
+      result.verdict = rubric.passed ? "completed" : "needs_fix";
+      result.review = rubric;
+      if (!rubric.passed && (!result.issues || result.issues.length === 0)) {
+        const autoIssues = [];
+        for (const b of rubric.failedBlocking) {
+          autoIssues.push(`[Блокер: ${b.label}] ${b.note || "требуется исправление"}`);
+        }
+        for (const o of rubric.failedOptional) {
+          autoIssues.push(`[${o.label}, -${o.weight} б.] ${o.note || "не выполнено"}`);
+        }
+        for (const p of rubric.partialOptional) {
+          autoIssues.push(`[${p.label}, частично] ${p.note || "требуется доработка"}`);
+        }
+        if (autoIssues.length > 0) {
+          result.issues = autoIssues;
+        }
+      }
+    }
+  }
+
   return result;
 }
 
@@ -224,6 +535,40 @@ export function buildClassifierMessages(ctx) {
   ];
 }
 
+function formatReviewHistoryForPrompt(reviewHistory) {
+  if (!Array.isArray(reviewHistory) || reviewHistory.length === 0) return "";
+  const lines = [];
+  for (const entry of reviewHistory) {
+    if (!entry || typeof entry !== "object") continue;
+    const attemptNum = entry.attempt ?? "?";
+    const scorePart = entry.review
+      ? ` | optional score: ${entry.review.earned}/${entry.review.applicableMax} (threshold ${entry.review.effectiveThreshold})`
+      : "";
+    lines.push(`Attempt #${attemptNum}: verdict=${entry.verdict ?? "unknown"}${scorePart}`);
+    if (entry.reason) {
+      lines.push(`  Reason: ${entry.reason}`);
+    }
+    if (entry.review?.checks && typeof entry.review.checks === "object") {
+      const nonPass = Object.values(entry.review.checks)
+        .filter((c) => c && c.status !== "pass" && c.status !== "na")
+        .map((c) => `${c.id}=${c.status}${c.note ? ` (${c.note})` : ""}`);
+      const passedIds = Object.values(entry.review.checks)
+        .filter((c) => c && c.status === "pass")
+        .map((c) => c.id);
+      if (passedIds.length > 0) {
+        lines.push(`  Passed checks: ${passedIds.join(", ")}`);
+      }
+      if (nonPass.length > 0) {
+        lines.push(`  Failed/partial checks: ${nonPass.join("; ")}`);
+      }
+    }
+    if (Array.isArray(entry.issues) && entry.issues.length > 0) {
+      lines.push(`  Issues reported: ${entry.issues.join(" | ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 export function buildReviewerMessages(ctx, hasTools = false) {
   const {
     epic = null,
@@ -233,41 +578,70 @@ export function buildReviewerMessages(ctx, hasTools = false) {
     gitLog = "",
     gitDiff = "",
     ciSummary = "",
+    reviewConfig = null,
+    reviewAttempt = 1,
+    reviewHistory = [],
   } = ctx ?? {};
+
+  const enabledOptionalIds = normalizeOptionalReviewChecks(reviewConfig?.optionalChecks);
+  const enabledSet = new Set(enabledOptionalIds);
+  const enabledOptionalDefs = OPTIONAL_REVIEW_CHECKS.filter((c) => enabledSet.has(c.id));
+  const maxOptionalScore = getMaxOptionalReviewScore(enabledOptionalIds);
+  const minScore = resolveMinReviewScore(reviewConfig?.minReviewScore, enabledOptionalIds);
+
+  const blockingLines = BLOCKING_REVIEW_CHECKS.map(
+    (c) => `   - "${c.id}" [BLOCKING]: ${c.promptRule}`,
+  );
+  const optionalLines =
+    enabledOptionalDefs.length > 0
+      ? enabledOptionalDefs.map(
+          (c) => `   - "${c.id}" (+${c.weight} pts): ${c.promptRule}`,
+        )
+      : [
+          "   - (None enabled — minimum strictness mode: evaluate ONLY the mandatory blocking checks above.)",
+        ];
 
   const systemPrompt = [
     "You are an independent, skeptical senior code reviewer and verification auditor.",
     "Your job is to verify whether the coding agent genuinely completed the assigned task/epic with real, working code — or whether it fabricated results, took shortcuts, left stubs, or missed requirements.",
     "",
-    "Core verification rules (anti-hallucination & anti-reward-hacking):",
+    "Core verification rules (anti-hallucination, anti-reward-hacking, anti-loop):",
     "1. NEVER treat the coding agent's own summary or claims ('done', 'all tests pass', 'implemented X') as proof. Verify every claim against actual code changes, file contents, and observed command output.",
     hasTools
-      ? "2. Use your read-only inspection tools (`git_diff`, `read_file`, `git_status`, `list_files`, `read_terminal`) to inspect the actual modified files, tests, and terminal output before approving. Do not guess or invent file paths, line numbers, or test results you did not observe."
+      ? "2. Use your read-only inspection tools (`git_diff`, `read_file`, `git_status`, `list_files`, `read_terminal`) to inspect the actual modified files, tests, saved verification logs, and terminal output before approving. Do not guess or invent file paths, line numbers, or test results you did not observe."
       : "2. Base your judgment strictly on the provided diff, git status/log, CI summary, and terminal output. Do not invent file paths, line numbers, or test results not present in the evidence.",
-    "3. Check for fabrication, stubs, and reward hacking:",
-    "   - Missing or partial implementation of the task, subitems, or Definition of Done.",
-    "   - Placeholder code (`TODO`, `FIXME`, `NotImplemented`, empty handlers, hardcoded fake returns, silent error swallowing).",
-    "   - Test cheating: skipped/disabled tests (`test.skip`, `xit`), deleted assertions, trivial assertions, or claiming tests passed when terminal output shows failures or no test run after the last edit.",
-    "   - Uncommitted/broken state or backlog status mismatch when the task is claimed done.",
-    "4. Choose exactly one verdict:",
-    '   - "completed": verified against real diff/files/terminal output; requirements and checks are genuinely satisfied with no pending CI wait.',
+    "3. Avoid false rejections and endless review loops:",
+    "   - Only require fresh test/build runs for the layer actually modified in the latest changes. Do NOT fail `checks_passed` merely because earlier unrelated build/test steps scrolled past the 400-line terminal tail when no failure is observed; check saved log files via `list_files` + `read_file` if present.",
+    "   - Do NOT invent requirements outside the assigned task/DoD/agent's stated scope, and do NOT penalize pre-existing untouched code.",
+    "   - On retry attempts (attempt > 1), check `Previous review history` first: verify whether previously reported issues were fixed, and do NOT flip previously `pass` checks to `fail` unless the new diff introduced a regression in them.",
+    "",
+    "4. Evaluate the structured rubric below. The host computes the final score and pass/fail verdict deterministically from your `checks`:",
+    "   Mandatory BLOCKING checks (rate strictly as `pass` or `fail`, or `na` only if genuinely inapplicable):",
+    ...blockingLines,
+    "",
+    enabledOptionalDefs.length > 0
+      ? `   Optional strictness checks (rate as \`pass\` = 100%, \`partial\` = 50%, \`fail\` = 0%, or \`na\` if inapplicable; required threshold: ${minScore}/${maxOptionalScore} pts):`
+      : "   Optional strictness checks:",
+    ...optionalLines,
+    "",
+    "5. Choose `state`:",
+    '   - "reviewed": you completed the rubric evaluation above (host decides completed vs needs_fix from `checks`).',
     '   - "waiting_ci": changes look solid and were pushed/triggered CI, and CI checks are still running.',
-    '   - "needs_fix": concrete defects, missing requirements, stubs, failing/missing tests, or unverified/fabricated claims were found that the agent must fix.',
     '   - "needs_user": the agent is asking the user a question, needs credentials/approval, or evidence is genuinely ambiguous.',
     '   - "failed": fatal unrecoverable error or aborted run.',
     "",
-    "Respond strictly with a single JSON object (reason and issues in Russian):",
-    '{"verdict":"completed|waiting_ci|needs_fix|needs_user|failed","reason":"concise verdict summary in Russian","evidence":["concrete file:line or observed command output"],"issues":["specific actionable defect to fix if verdict is needs_fix"],"ci_ref":"optional branch or PR ref"}',
+    "Respond strictly with a single JSON object (reason, check notes, and issues in Russian):",
+    '{"state":"reviewed|waiting_ci|needs_user|failed","reason":"concise verdict summary in Russian","checks":{"<check_id>":{"status":"pass|partial|fail|na","note":"short factual note in Russian"}},"evidence":["concrete file:line or observed command output"],"issues":["specific actionable defect to fix if any check failed or scored partial"],"ci_ref":"optional branch or PR ref"}',
   ].join("\n");
 
   const parts = [];
   if (epic) {
     parts.push(`Epic: ${epic.id ?? ""} — ${epic.title ?? ""}`.trim());
     if (epic.goal) {
-      parts.push(`Epic Goal:\n${tailText(epic.goal, 1500)}`);
+      parts.push(`Epic Goal:\n${tailText(epic.goal, 2000)}`);
     }
     if (epic.dod) {
-      parts.push(`Definition of Done:\n${tailText(epic.dod, 2000)}`);
+      parts.push(`Definition of Done:\n${tailText(epic.dod, 2500)}`);
     }
   }
   if (task) {
@@ -283,20 +657,26 @@ export function buildReviewerMessages(ctx, hasTools = false) {
     );
   }
 
-  const cleanTail = tailText(stripAnsi(terminalTail), 8000).trim();
+  parts.push(`Current review attempt: #${reviewAttempt}`);
+  const historyText = formatReviewHistoryForPrompt(reviewHistory);
+  if (historyText) {
+    parts.push(`Previous review history (do not forget prior findings or regress passed checks):\n${tailText(historyText, 6000)}`);
+  }
+
+  const cleanTail = tailText(stripAnsi(terminalTail), 14000).trim();
   parts.push(`Terminal tail:\n${cleanTail || "(empty)"}`);
 
   if (gitStatus && String(gitStatus).trim()) {
-    parts.push(`Git status:\n${tailText(String(gitStatus).trim(), 2500)}`);
+    parts.push(`Git status:\n${tailText(String(gitStatus).trim(), 3500)}`);
   }
   if (gitLog && String(gitLog).trim()) {
-    parts.push(`Git log:\n${tailText(String(gitLog).trim(), 2500)}`);
+    parts.push(`Git log:\n${tailText(String(gitLog).trim(), 3500)}`);
   }
   if (gitDiff && String(gitDiff).trim()) {
-    parts.push(`Git diff snapshot:\n${tailText(String(gitDiff).trim(), 10000)}`);
+    parts.push(`Git diff snapshot:\n${tailText(String(gitDiff).trim(), 18000)}`);
   }
   if (ciSummary && String(ciSummary).trim()) {
-    parts.push(`CI summary:\n${tailText(String(ciSummary).trim(), 1500)}`);
+    parts.push(`CI summary:\n${tailText(String(ciSummary).trim(), 2000)}`);
   }
 
   return [
@@ -449,6 +829,7 @@ async function runSingleShotClassification(
   maxTokens,
   fetchFn,
   options = {},
+  reviewConfig = null,
 ) {
   const sendRequest = (withResponseFormat) => {
     const body = {
@@ -475,7 +856,7 @@ async function runSingleShotClassification(
   }
 
   const content = data?.choices?.[0]?.message?.content ?? "";
-  return parseClassifierVerdict(content);
+  return parseClassifierVerdict(content, reviewConfig);
 }
 
 export async function classifySessionTurn(
@@ -504,13 +885,23 @@ export async function classifySessionTurn(
   const isReviewer = ctx?.reviewMode === "reviewer";
   if (!isReviewer) {
     const messages = buildClassifierMessages(ctx);
-    return runSingleShotClassification(url, headers, model, messages, 400, fetchFn, options);
+    return runSingleShotClassification(url, headers, model, messages, 400, fetchFn, options, null);
   }
 
+  const reviewConfig = ctx?.reviewConfig ?? null;
   const hasTools = typeof toolExecutor === "function";
   const messages = buildReviewerMessages(ctx, hasTools);
   if (!hasTools) {
-    return runSingleShotClassification(url, headers, model, messages, 1000, fetchFn, options);
+    return runSingleShotClassification(
+      url,
+      headers,
+      model,
+      messages,
+      1600,
+      fetchFn,
+      options,
+      reviewConfig,
+    );
   }
 
   let useResponseFormat = true;
@@ -519,7 +910,7 @@ export async function classifySessionTurn(
       model,
       messages,
       temperature: 0,
-      max_tokens: 1000,
+      max_tokens: 1600,
       tools: REVIEWER_TOOLS,
       tool_choice: "auto",
     };
@@ -543,9 +934,10 @@ export async function classifySessionTurn(
         headers,
         model,
         fallbackMessages,
-        1000,
+        1600,
         fetchFn,
         options,
+        reviewConfig,
       );
     }
 
@@ -558,7 +950,7 @@ export async function classifySessionTurn(
     const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
 
     if (toolCalls.length === 0) {
-      return parseClassifierVerdict(msg?.content ?? "");
+      return parseClassifierVerdict(msg?.content ?? "", reviewConfig);
     }
 
     messages.push({
@@ -594,5 +986,14 @@ export async function classifySessionTurn(
     content:
       "Tool inspection budget reached. Return your final JSON verdict now based strictly on the evidence observed so far.",
   });
-  return runSingleShotClassification(url, headers, model, messages, 1000, fetchFn, options);
+  return runSingleShotClassification(
+    url,
+    headers,
+    model,
+    messages,
+    1600,
+    fetchFn,
+    options,
+    reviewConfig,
+  );
 }

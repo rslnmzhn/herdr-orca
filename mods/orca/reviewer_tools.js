@@ -266,17 +266,31 @@ export function createReviewerToolExecutor({
         if (dir && !isSafeRelativePath(dir)) {
           return "Error: invalid relative directory";
         }
-        const gitArgs = ["ls-files"];
-        if (dir) gitArgs.push("--", dir);
-        const res = await execFn("git", gitArgs, execOpts);
-        if (res.code !== 0) {
-          return `Error running git ls-files: ${(res.stderr || res.stdout || "failed").trim()}`;
+        const trackedArgs = ["ls-files"];
+        const untrackedArgs = ["ls-files", "--others", "--exclude-standard"];
+        if (dir) {
+          trackedArgs.push("--", dir);
+          untrackedArgs.push("--", dir);
         }
-        const lines = String(res.stdout ?? "")
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter(Boolean);
-        if (lines.length === 0) return "(no tracked files matched)";
+        const [trackedRes, untrackedRes] = await Promise.all([
+          execFn("git", trackedArgs, execOpts),
+          execFn("git", untrackedArgs, execOpts).catch(() => ({ code: 1, stdout: "" })),
+        ]);
+        if (trackedRes.code !== 0 && untrackedRes.code !== 0) {
+          return `Error running git ls-files: ${(trackedRes.stderr || trackedRes.stdout || "failed").trim()}`;
+        }
+        const seen = new Set();
+        const lines = [];
+        for (const raw of [trackedRes.stdout, untrackedRes.stdout]) {
+          for (const line of String(raw ?? "").split(/\r?\n/)) {
+            const clean = line.trim();
+            if (clean && !seen.has(clean)) {
+              seen.add(clean);
+              lines.push(clean);
+            }
+          }
+        }
+        if (lines.length === 0) return "(no tracked or untracked files matched)";
         const shown = lines.slice(0, MAX_LIST_FILES);
         const suffix = lines.length > MAX_LIST_FILES ? `\n... (+${lines.length - MAX_LIST_FILES} more)` : "";
         return capOutput(shown.join("\n") + suffix);
@@ -319,7 +333,14 @@ export function createReviewerToolExecutor({
   };
 }
 
-export function buildReviewFixPrompt(epic, task, verdict, attempt, maxRetries) {
+function formatCheckStatusTag(status) {
+  if (status === "pass") return "PASS";
+  if (status === "partial") return "PARTIAL";
+  if (status === "fail") return "FAIL";
+  return "N/A";
+}
+
+export function buildReviewFixPrompt(epic, task, verdict, attempt, maxRetries, reviewHistory = []) {
   const maxLabel = maxRetries === 0 ? "∞" : String(maxRetries);
   const lines = [
     `Ревьювер отклонил выполнение (попытка ${attempt}/${maxLabel}). Исправь замечания и подтверди результат реальным запуском проверок/тестов.`,
@@ -334,6 +355,48 @@ export function buildReviewFixPrompt(epic, task, verdict, attempt, maxRetries) {
   }
   if (verdict?.reason) {
     lines.push(`Причина отклонения: ${verdict.reason}`);
+  }
+
+  const review = verdict?.review;
+  if (review && typeof review === "object") {
+    lines.push(
+      "",
+      "План и итоги текущего ревью:",
+      `- Блокирующие проверки: ${review.blockingPassed ? "пройдены" : `провалены (${review.failedBlocking.map((b) => b.label).join(", ")})`}`,
+    );
+    if (review.selectedMax > 0) {
+      lines.push(
+        `- Дополнительные баллы: ${review.earned}/${review.applicableMax} (порог: ${review.effectiveThreshold})`,
+      );
+    } else {
+      lines.push("- Режим строгости: минимальный (только блокирующие проверки)");
+    }
+    const checkEntries = review.checks && typeof review.checks === "object" ? Object.values(review.checks) : [];
+    if (checkEntries.length > 0) {
+      lines.push("Чеклист ревью:");
+      for (const chk of checkEntries) {
+        if (!chk) continue;
+        const kind = chk.blocking ? "блокер" : `+${chk.weight} б.`;
+        const notePart = chk.note ? ` — ${chk.note}` : "";
+        lines.push(`- [${formatCheckStatusTag(chk.status)}] ${chk.label} (${kind})${notePart}`);
+      }
+    }
+  }
+
+  const priorRounds = Array.isArray(reviewHistory) ? reviewHistory.filter(Boolean) : [];
+  if (priorRounds.length > 0) {
+    lines.push("", "История предыдущих раундов ревью (не забывай прошлые ошибки и не ломай уже принятое):");
+    for (const prev of priorRounds) {
+      const prevAttempt = prev.attempt ?? "?";
+      const prevScore = prev.review?.selectedMax > 0
+        ? ` (${prev.review.earned}/${prev.review.applicableMax}, порог ${prev.review.effectiveThreshold})`
+        : "";
+      lines.push(`- Попытка #${prevAttempt}${prevScore}: ${prev.reason || prev.verdict || "отклонено"}`);
+      const prevIssues = Array.isArray(prev.issues) ? prev.issues.filter(Boolean) : [];
+      for (const pi of prevIssues) {
+        lines.push(`  * ${pi}`);
+      }
+    }
   }
 
   const issues = Array.isArray(verdict?.issues) ? verdict.issues.filter(Boolean) : [];
@@ -355,8 +418,8 @@ export function buildReviewFixPrompt(epic, task, verdict, attempt, maxRetries) {
   lines.push(
     "",
     "Инструкции:",
-    "1. Устрани все перечисленные замечания без заглушек, TODO и пропуска тестов.",
-    "2. Запусти релевантные тесты/проверки и убедись, что они реально проходят после последних правок.",
+    "1. Устрани все перечисленные замечания (в первую очередь блокеры и просевшие пункты чеклиста) без заглушек, TODO и пропуска тестов.",
+    "2. Запусти релевантные тесты/проверки для затронутого слоя и убедись, что они реально проходят после последних правок.",
   );
   if (epic?.filePath) {
     lines.push(

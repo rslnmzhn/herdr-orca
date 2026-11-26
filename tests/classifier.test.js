@@ -1,10 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import {
+  DEFAULT_MIN_REVIEW_SCORE,
+  BLOCKING_REVIEW_CHECKS,
+  OPTIONAL_REVIEW_CHECKS,
+  getDefaultOptionalReviewChecks,
+  getMaxOptionalReviewScore,
+  resolveMinReviewScore,
+  evaluateReviewRubric,
   stripAnsi,
   normalizeBaseUrl,
   fetchModels,
   parseClassifierVerdict,
   buildClassifierMessages,
+  buildReviewerMessages,
   classifySessionTurn,
 } from "../mods/orca/classifier.js";
 
@@ -355,5 +363,152 @@ describe("fetchModels & classifySessionTurn", () => {
       ),
     ).rejects.toThrow(/401/);
     expect(authCalls).toBe(1);
+  });
+});
+
+describe("review strictness rubric & history", () => {
+  test("resolves default min score (15) and clamps to selected optional checkboxes sum", () => {
+    const defaults = getDefaultOptionalReviewChecks();
+    expect(defaults).toEqual(["integration_wired", "error_handling", "tests_exist_and_meaningful"]);
+    expect(getMaxOptionalReviewScore(defaults)).toBe(21);
+    expect(resolveMinReviewScore("", defaults)).toBe(DEFAULT_MIN_REVIEW_SCORE);
+    expect(resolveMinReviewScore("999", defaults)).toBe(21);
+    expect(resolveMinReviewScore("", ["clean_diff_and_logs"])).toBe(5);
+    expect(resolveMinReviewScore("10", [])).toBe(0);
+  });
+
+  test("minimum strictness mode evaluates only blocking checks and ignores optional score", () => {
+    const allBlockingPass = Object.fromEntries(
+      BLOCKING_REVIEW_CHECKS.map((c) => [c.id, { status: "pass", note: "ok" }]),
+    );
+    const resPass = evaluateReviewRubric(allBlockingPass, { optionalChecks: [], minReviewScore: 15 });
+    expect(resPass.passed).toBe(true);
+    expect(resPass.blockingPassed).toBe(true);
+    expect(resPass.selectedMax).toBe(0);
+
+    const withBlockingFail = {
+      ...allBlockingPass,
+      no_stubs: { status: "fail", note: "оставлен TODO" },
+    };
+    const resFail = evaluateReviewRubric(withBlockingFail, { optionalChecks: [], minReviewScore: 0 });
+    expect(resFail.passed).toBe(false);
+    expect(resFail.blockingPassed).toBe(false);
+    expect(resFail.failedBlocking).toHaveLength(1);
+  });
+
+  test("blocking failure rejects even when optional score exceeds threshold, while minor optional partial passes", () => {
+    const cfg = {
+      optionalChecks: ["integration_wired", "error_handling", "tests_exist_and_meaningful", "clean_diff_and_logs"],
+      minReviewScore: 15,
+    };
+    const blockingOk = Object.fromEntries(
+      BLOCKING_REVIEW_CHECKS.map((c) => [c.id, { status: "pass", note: "ok" }]),
+    );
+
+    const minorPartial = parseClassifierVerdict(
+      JSON.stringify({
+        state: "reviewed",
+        reason: "Основная логика и тесты в порядке, есть мелкий дубль лога",
+        checks: {
+          ...blockingOk,
+          integration_wired: { status: "pass", note: "подключено" },
+          error_handling: { status: "pass", note: "ошибки пробрасываются" },
+          tests_exist_and_meaningful: { status: "pass", note: "тесты есть" },
+          clean_diff_and_logs: { status: "partial", note: "двойной warn!" },
+        },
+      }),
+      cfg,
+    );
+    expect(minorPartial.verdict).toBe("completed");
+    expect(minorPartial.review.earned).toBe(23.5);
+    expect(minorPartial.review.effectiveThreshold).toBe(15);
+
+    const blockingBroken = parseClassifierVerdict(
+      JSON.stringify({
+        state: "reviewed",
+        reason: "Есть заглушка",
+        checks: {
+          ...blockingOk,
+          no_stubs: { status: "fail", note: "TODO в auth.js" },
+          integration_wired: { status: "pass", note: "ok" },
+          error_handling: { status: "pass", note: "ok" },
+          tests_exist_and_meaningful: { status: "pass", note: "ok" },
+          clean_diff_and_logs: { status: "pass", note: "ok" },
+        },
+      }),
+      cfg,
+    );
+    expect(blockingBroken.verdict).toBe("needs_fix");
+    expect(blockingBroken.review.blockingPassed).toBe(false);
+    expect(blockingBroken.issues[0]).toContain("Блокер");
+
+    const lowOptionalScore = parseClassifierVerdict(
+      JSON.stringify({
+        state: "reviewed",
+        reason: "Недостаточно баллов по доп. критериям",
+        checks: {
+          ...blockingOk,
+          integration_wired: { status: "pass", note: "ok" },
+          error_handling: { status: "fail", note: "ошибки глотаются" },
+          tests_exist_and_meaningful: { status: "fail", note: "нет тестов" },
+          clean_diff_and_logs: { status: "pass", note: "ok" },
+        },
+      }),
+      cfg,
+    );
+    expect(lowOptionalScore.verdict).toBe("needs_fix");
+    expect(lowOptionalScore.review.earned).toBe(12);
+    expect(lowOptionalScore.review.scorePassed).toBe(false);
+  });
+
+  test("buildReviewerMessages includes strictness rubric, attempt number, and previous review history", () => {
+    const msgs = buildReviewerMessages(
+      {
+        epic: { id: "EPIC-1", title: "Core", goal: "Goal", dod: "DoD" },
+        task: { id: "TASK-1.1", title: "Fix", subitems: ["Sub 1"] },
+        terminalTail: "cargo test ok",
+        reviewConfig: {
+          optionalChecks: ["error_handling", "clean_diff_and_logs"],
+          minReviewScore: 10,
+        },
+        reviewAttempt: 2,
+        reviewHistory: [
+          {
+            attempt: 1,
+            verdict: "needs_fix",
+            reason: "Пропущена обработка ошибки",
+            issues: ["Обработать Err в lib.rs"],
+            review: {
+              earned: 5,
+              applicableMax: 13,
+              effectiveThreshold: 10,
+              checks: {
+                requirements_met: { id: "requirements_met", status: "pass", note: "ok" },
+                error_handling: { id: "error_handling", status: "fail", note: "unwrap()" },
+              },
+            },
+          },
+        ],
+      },
+      true,
+    );
+
+    expect(msgs[0].content).toContain("required threshold: 10/13 pts");
+    expect(msgs[0].content).toContain('"error_handling" (+8 pts)');
+    expect(msgs[0].content).not.toContain('"modularity_no_god_object"');
+    expect(msgs[1].content).toContain("Current review attempt: #2");
+    expect(msgs[1].content).toContain("Previous review history");
+    expect(msgs[1].content).toContain("Обработать Err в lib.rs");
+    expect(msgs[1].content).toContain("Passed checks: requirements_met");
+
+    const minMsgs = buildReviewerMessages(
+      {
+        terminalTail: "ok",
+        reviewConfig: { optionalChecks: [], minReviewScore: 0 },
+      },
+      false,
+    );
+    expect(minMsgs[0].content).toContain("minimum strictness mode");
+    expect(OPTIONAL_REVIEW_CHECKS.length).toBeGreaterThan(0);
   });
 });

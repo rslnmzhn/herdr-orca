@@ -38,6 +38,7 @@ export function createSessionState(terminal, defaults = {}) {
     ciRetryCount: 0,
     reviewRetryCount: 0,
     reviewProgress: null,
+    reviewHistory: [],
     ciInfo: null,
     nextCiCheckAt: null,
     ciChecking: false,

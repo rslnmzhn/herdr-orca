@@ -1,6 +1,12 @@
 import { div, svg } from "gpui-kit";
 import { v_flex, h_flex, Input, Scrollbar } from "gpui-base";
 import { COLUMNS } from "./parser.js";
+import {
+  BLOCKING_REVIEW_CHECKS,
+  OPTIONAL_REVIEW_CHECKS,
+  getMaxOptionalReviewScore,
+  normalizeOptionalReviewChecks,
+} from "./classifier.js";
 
 const COLUMN_LABELS = Object.fromEntries(COLUMNS.map((c) => [c.id, c.label]));
 
@@ -855,6 +861,17 @@ export function renderPipelineStrip(view, t) {
                   alpha(s.lastVerdict.verdict === "needs_fix" ? (t.working ?? t.ansi3) : t.accent, "1e"),
                 ),
               )
+              .when(Boolean(s.lastVerdict.review), (r) =>
+                r.child(
+                  badge(
+                    s.lastVerdict.review.selectedMax > 0
+                      ? `${s.lastVerdict.review.earned}/${s.lastVerdict.review.applicableMax} б.`
+                      : "Блокеры",
+                    s.lastVerdict.review.passed ? (t.done ?? t.ansi2) : (t.working ?? t.ansi3),
+                    alpha(s.lastVerdict.review.passed ? (t.done ?? t.ansi2) : (t.working ?? t.ansi3), "1c"),
+                  ),
+                ),
+              )
               .when(Boolean(s.lastVerdict.reason), (r) =>
                 r.child(
                   div()
@@ -1280,6 +1297,12 @@ export function renderFooterAndSettings(view, t) {
   const selectedModel = view.modelInput ? view.modelInput.value().trim() : view.settings?.model;
   const maxDropdownH = Math.max(90, Math.min(180, Math.round(((view.size?.height ?? 800) - 360) * 0.5)));
   const dropdownListHeight = Math.min(maxDropdownH, Math.max(40, filteredModels.length * 28 + 12));
+  const draftOptional = normalizeOptionalReviewChecks(
+    view.draftOptionalChecks ?? view.settings?.optionalReviewChecks,
+  );
+  const draftOptionalSet = new Set(draftOptional);
+  const maxOptionalScore = getMaxOptionalReviewScore(draftOptional);
+  const blockingTip = BLOCKING_REVIEW_CHECKS.map((c) => `• ${c.label}`).join("\n");
 
   return v_flex()
     .id("orca-footer-wrap")
@@ -1540,6 +1563,137 @@ export function renderFooterAndSettings(view, t) {
                       .text_size(10.5)
                       .text_color(t.dim)
                       .child("0 = бесконечно, по умолчанию 3"),
+                  ),
+              )
+              .child(
+                v_flex()
+                  .id("orca-review-strictness")
+                  .p(8)
+                  .gap(7)
+                  .rounded(7)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.background)
+                  .child(
+                    h_flex()
+                      .flex_wrap()
+                      .gap(8)
+                      .items_center()
+                      .justify_between()
+                      .child(
+                        h_flex()
+                          .gap(6)
+                          .items_center()
+                          .flex_wrap()
+                          .child(
+                            div()
+                              .text_size(11)
+                              .font_semibold()
+                              .text_color(t.foreground)
+                              .child("Строгость ревью"),
+                          )
+                          .child(
+                            h_flex()
+                              .id("orca-blocking-min-badge")
+                              .h(20)
+                              .px(7)
+                              .gap(4)
+                              .items_center()
+                              .rounded(5)
+                              .border_1()
+                              .border_color(alpha(t.accent, "44"))
+                              .bg(alpha(t.accent, "14"))
+                              .opacity(0.85)
+                              .tooltip(`Минимум (всегда включено, нельзя отключить):\n${blockingTip}`)
+                              .child(
+                                svg("mods/orca/icons/check.svg")
+                                  .size(10)
+                                  .flex_none()
+                                  .text_color(t.accent),
+                              )
+                              .child(
+                                div()
+                                  .text_size(10.5)
+                                  .font_medium()
+                                  .text_color(t.accent)
+                                  .child(`Минимум: блокеры (${BLOCKING_REVIEW_CHECKS.length})`),
+                              ),
+                          ),
+                      )
+                      .child(
+                        h_flex()
+                          .gap(6)
+                          .items_center()
+                          .child(
+                            div()
+                              .text_size(11)
+                              .text_color(t.muted)
+                              .tooltip("Сколько баллов нужно набрать по выбранным чекбоксам (пусто = 15)")
+                              .child("Порог баллов:"),
+                          )
+                          .child(
+                            renderInputBox("orca-input-min-review-score", view.minReviewScoreInput, t, {
+                              w: 64,
+                            }),
+                          )
+                          .child(
+                            div()
+                              .text_size(10.5)
+                              .text_color(t.dim)
+                              .child(`из ${maxOptionalScore} (пусто = 15)`),
+                          ),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .flex_wrap()
+                      .gap(5)
+                      .children(
+                        OPTIONAL_REVIEW_CHECKS.map((chk) => {
+                          const checked = draftOptionalSet.has(chk.id);
+                          return h_flex()
+                            .id(`orca-opt-chk-${chk.id}`)
+                            .h(22)
+                            .px(7)
+                            .gap(5)
+                            .flex_none()
+                            .items_center()
+                            .rounded(5)
+                            .border_1()
+                            .border_color(checked ? alpha(t.accent, "66") : t.border)
+                            .bg(checked ? alpha(t.accent, "16") : t.surface)
+                            .cursor_pointer()
+                            .tooltip(`${chk.label} (+${chk.weight} б.)`)
+                            .hover((st) => st.bg(t.hover))
+                            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                            .on_click((_e, cx) => view.toggleOptionalReviewCheck(chk.id, cx))
+                            .child(
+                              h_flex()
+                                .size(12)
+                                .flex_none()
+                                .items_center()
+                                .justify_center()
+                                .rounded(3)
+                                .border_1()
+                                .border_color(checked ? t.accent : t.input)
+                                .bg(checked ? t.accent : t.background)
+                                .when(checked, (el) =>
+                                  el.child(
+                                    svg("mods/orca/icons/check.svg")
+                                      .size(8)
+                                      .text_color(t.solid_foreground),
+                                  ),
+                                ),
+                            )
+                            .child(
+                              div()
+                                .text_size(10.5)
+                                .when(checked, (el) => el.font_medium())
+                                .text_color(checked ? t.foreground : t.muted)
+                                .child(`${chk.label} (+${chk.weight})`),
+                            );
+                        }),
+                      ),
                   ),
               )
               .when(Boolean(view.modelsError), (err) =>

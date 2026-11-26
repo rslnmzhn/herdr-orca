@@ -36,7 +36,15 @@ import {
   pickNextQueueItem,
 } from "./parser.js";
 import { normPath, joinPath, parentDir, expandTilde } from "./paths.js";
-import { normalizeBaseUrl, fetchModels, classifySessionTurn } from "./classifier.js";
+import {
+  DEFAULT_MIN_REVIEW_SCORE,
+  normalizeBaseUrl,
+  fetchModels,
+  classifySessionTurn,
+  normalizeOptionalReviewChecks,
+  getMaxOptionalReviewScore,
+  resolveMinReviewScore,
+} from "./classifier.js";
 import {
   checkGithubCiStatus,
   fetchFailedCiLogs,
@@ -94,6 +102,8 @@ function normalizeSettings(raw) {
   const autoCompact = Boolean(obj.autoCompact);
   const parsedPoll = Number(obj.ciPollMinutes);
   const ciPollMinutes = Number.isFinite(parsedPoll) && parsedPoll > 0 ? parsedPoll : 5;
+  const optionalReviewChecks = normalizeOptionalReviewChecks(obj.optionalReviewChecks);
+  const minReviewScore = resolveMinReviewScore(obj.minReviewScore, optionalReviewChecks);
   return {
     baseUrl,
     apiKey,
@@ -103,6 +113,8 @@ function normalizeSettings(raw) {
     reviewMode,
     autoCompact,
     ciPollMinutes,
+    optionalReviewChecks,
+    minReviewScore,
   };
 }
 
@@ -284,6 +296,35 @@ export default class Orca extends View {
       value: String(this.settings.maxReviewRetries),
     });
     this.maxReviewRetriesInput.on("submit", (_e, cx) => this.saveSettings(cx));
+
+    this.draftOptionalChecks = [...this.settings.optionalReviewChecks];
+    this._clampingMinScore = false;
+    this.minReviewScoreInput = InputState.new({
+      placeholder: String(
+        Math.min(DEFAULT_MIN_REVIEW_SCORE, getMaxOptionalReviewScore(this.draftOptionalChecks)),
+      ),
+      value: String(this.settings.minReviewScore),
+    });
+    this.minReviewScoreInput.on("change", (_e, cx) => {
+      if (this._clampingMinScore) return;
+      const raw = this.minReviewScoreInput.value();
+      const digits = raw.replace(/[^\d]/g, "");
+      const maxPts = getMaxOptionalReviewScore(this.draftOptionalChecks);
+      let nextVal = digits;
+      if (digits !== "") {
+        const num = Number(digits);
+        if (num > maxPts) {
+          nextVal = String(maxPts);
+        }
+      }
+      if (nextVal !== raw) {
+        this._clampingMinScore = true;
+        this.minReviewScoreInput.set_value(nextVal);
+        this._clampingMinScore = false;
+      }
+      cx.notify();
+    });
+    this.minReviewScoreInput.on("submit", (_e, cx) => this.saveSettings(cx));
 
     this.sessions = new Map();
     this.fallbackSession = createSessionState(null, { mode: this.defaultMode });
@@ -1015,10 +1056,36 @@ export default class Orca extends View {
       this.modelInput.set_value(this.settings.model || "");
       this.maxRetriesInput.set_value(String(this.settings.maxCiRetries ?? 3));
       this.maxReviewRetriesInput.set_value(String(this.settings.maxReviewRetries ?? 3));
+      this.draftOptionalChecks = normalizeOptionalReviewChecks(this.settings.optionalReviewChecks);
+      this._clampingMinScore = true;
+      this.minReviewScoreInput.set_value(String(this.settings.minReviewScore ?? 0));
+      this._clampingMinScore = false;
       this.modelsError = null;
     } else {
       this.handle.focus();
     }
+    cx.notify();
+  }
+
+  toggleOptionalReviewCheck(checkId, cx) {
+    const current = new Set(normalizeOptionalReviewChecks(this.draftOptionalChecks));
+    if (current.has(checkId)) {
+      current.delete(checkId);
+    } else {
+      current.add(checkId);
+    }
+    this.draftOptionalChecks = normalizeOptionalReviewChecks([...current]);
+    const maxPts = getMaxOptionalReviewScore(this.draftOptionalChecks);
+    const rawScore = this.minReviewScoreInput.value().trim();
+    if (rawScore !== "") {
+      const parsed = Number(rawScore);
+      if (Number.isFinite(parsed) && parsed > maxPts) {
+        this._clampingMinScore = true;
+        this.minReviewScoreInput.set_value(String(maxPts));
+        this._clampingMinScore = false;
+      }
+    }
+    this.modelsError = null;
     cx.notify();
   }
 
@@ -1130,6 +1197,25 @@ export default class Orca extends View {
       maxReviewRetries = parsed;
     }
 
+    const optionalReviewChecks = normalizeOptionalReviewChecks(this.draftOptionalChecks);
+    const maxOptionalScore = getMaxOptionalReviewScore(optionalReviewChecks);
+    const rawMinScore = this.minReviewScoreInput.value().trim();
+    let minReviewScore = Math.min(DEFAULT_MIN_REVIEW_SCORE, maxOptionalScore);
+    if (rawMinScore !== "") {
+      const parsed = Number(rawMinScore);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > maxOptionalScore) {
+        this.modelsError = `Порог баллов должен быть целым числом от 0 до ${maxOptionalScore}`;
+        notify({
+          title: "Некорректный порог баллов ревью",
+          body: `Введите целое число от 0 до ${maxOptionalScore}`,
+          level: "warning",
+        });
+        cx.notify();
+        return;
+      }
+      minReviewScore = parsed;
+    }
+
     const model = this.modelInput.value().trim();
     const apiKey = this.apiKeyInput.value();
 
@@ -1140,10 +1226,15 @@ export default class Orca extends View {
       model,
       maxCiRetries,
       maxReviewRetries,
+      optionalReviewChecks,
+      minReviewScore,
     };
     this.baseUrlInput.set_value(normalizedUrl);
     this.maxRetriesInput.set_value(String(maxCiRetries));
     this.maxReviewRetriesInput.set_value(String(maxReviewRetries));
+    this._clampingMinScore = true;
+    this.minReviewScoreInput.set_value(String(minReviewScore));
+    this._clampingMinScore = false;
     setShared(STORAGE_SETTINGS, this.settings);
     this.modelsError = null;
     this.settingsOpen = false;
@@ -1375,6 +1466,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.lastVerdict = null;
@@ -1443,6 +1535,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.lastVerdict = null;
@@ -1563,6 +1656,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.lastVerdict = null;
@@ -1597,6 +1691,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.lastVerdict = null;
@@ -1735,7 +1830,7 @@ export default class Orca extends View {
           "read",
           runCtx.terminal,
           "--lines",
-          isReviewer ? "200" : "120",
+          isReviewer ? "300" : "120",
         ]).catch((e) => ({
           code: 1,
           stdout: "",
@@ -1829,6 +1924,13 @@ export default class Orca extends View {
             }
           : null;
 
+        const reviewAttempt = (session.reviewRetryCount ?? 0) + 1;
+        const reviewHistory = Array.isArray(session.reviewHistory) ? session.reviewHistory : [];
+        const reviewConfig = {
+          optionalChecks: this.settings?.optionalReviewChecks,
+          minReviewScore: this.settings?.minReviewScore,
+        };
+
         const verdict = await classifySessionTurn(
           this.settings,
           {
@@ -1840,6 +1942,9 @@ export default class Orca extends View {
             gitLog,
             gitDiff,
             ciSummary,
+            reviewConfig,
+            reviewAttempt,
+            reviewHistory,
           },
           fetch,
           toolExecutor,
@@ -1867,7 +1972,12 @@ export default class Orca extends View {
 
         session.reviewProgress = null;
         session.lastVerdict = verdict;
-        this.addLog(session, "info", `Вердикт: ${verdict.verdict} — ${verdict.reason}`);
+        const scoreSuffix = verdict.review
+          ? verdict.review.selectedMax > 0
+            ? ` [${verdict.review.earned}/${verdict.review.applicableMax} б., порог ${verdict.review.effectiveThreshold}]`
+            : " [минимум: блокеры]"
+          : "";
+        this.addLog(session, "info", `Вердикт: ${verdict.verdict}${scoreSuffix} — ${verdict.reason}`);
         if (Array.isArray(verdict.evidence) && verdict.evidence.length > 0) {
           this.addLog(session, "info", `Факты: ${verdict.evidence.slice(0, 3).join(" | ")}`);
         }
@@ -1944,7 +2054,18 @@ export default class Orca extends View {
     const summary = issues[0] || verdict?.reason || "Ревьювер отклонил выполнение";
 
     if (shouldRetryCi(session.reviewRetryCount, maxRetries)) {
+      const priorHistory = Array.isArray(session.reviewHistory) ? [...session.reviewHistory] : [];
       session.reviewRetryCount += 1;
+      session.reviewHistory = [
+        ...priorHistory,
+        {
+          attempt: session.reviewRetryCount,
+          verdict: verdict?.verdict ?? "needs_fix",
+          reason: verdict?.reason ?? "",
+          issues,
+          review: verdict?.review ?? null,
+        },
+      ];
       session.sendingPrompt = true;
       this.setSessionState(session, "advancing");
       session.statusReason = `Ревью: возврат на доработку (${summary})`;
@@ -1963,6 +2084,7 @@ export default class Orca extends View {
           verdict,
           session.reviewRetryCount,
           maxRetries,
+          priorHistory,
         );
         const sendRes = await hc(["send", runCtx.terminal, fixPrompt]).catch((e) => ({
           code: 1,
@@ -2266,6 +2388,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.lastVerdict = null;
@@ -2368,6 +2491,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.statusReason = reason || "Ревью пройдено";
@@ -2399,6 +2523,7 @@ export default class Orca extends View {
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
     session.reviewProgress = null;
+    session.reviewHistory = [];
     session.ciInfo = null;
     session.nextCiCheckAt = null;
     session.lastVerdict = null;
