@@ -276,4 +276,84 @@ describe("fetchModels & classifySessionTurn", () => {
     expect(res.verdict).toBe("completed");
     expect(res.evidence).toEqual(["34 pass in terminal"]);
   });
+
+  test("waitOnError retries on network errors, timeouts, 5xx/429, and invalid JSON until response arrives", async () => {
+    let attempt = 0;
+    const retries = [];
+    const mockFetch = async () => {
+      attempt++;
+      if (attempt === 1) throw new Error("ECONNRESET");
+      if (attempt === 2) return new Response("Bad Gateway", { status: 502 });
+      if (attempt === 3) return new Response("<html>not json</html>", { status: 200 });
+      if (attempt === 4) return new Promise(() => {}); // hangs -> triggers timeoutMs
+      return new Response(
+        JSON.stringify({
+          choices: [{ message: { content: '{"verdict":"completed","reason":"Готово"}' } }],
+        }),
+        { status: 200 },
+      );
+    };
+
+    const res = await classifySessionTurn(
+      { baseUrl: "http://localhost:11434/v1", apiKey: "", model: "qwen2.5" },
+      { epic: null, task: null, terminalTail: "ok", gitStatus: "", gitLog: "", ciSummary: "" },
+      mockFetch,
+      null,
+      null,
+      {
+        waitOnError: true,
+        timeoutMs: 20,
+        retryDelaysMs: [1],
+        onRetry: (info) => retries.push(info),
+      },
+    );
+
+    expect(attempt).toBe(5);
+    expect(retries).toHaveLength(4);
+    expect(res).toEqual({ verdict: "completed", reason: "Готово" });
+  });
+
+  test("waitOnError stops immediately when shouldAbort returns true or on 401 auth error", async () => {
+    let aborted = false;
+    let calls = 0;
+    const hangingOrFailingFetch = async () => {
+      calls++;
+      throw new Error("network down");
+    };
+
+    await expect(
+      classifySessionTurn(
+        { baseUrl: "http://localhost:11434/v1", apiKey: "", model: "qwen2.5" },
+        { epic: null, task: null, terminalTail: "", gitStatus: "", gitLog: "", ciSummary: "" },
+        hangingOrFailingFetch,
+        null,
+        null,
+        {
+          waitOnError: true,
+          sleepFn: async () => {
+            aborted = true;
+          },
+          shouldAbort: () => aborted,
+        },
+      ),
+    ).rejects.toThrow(/Aborted/);
+    expect(calls).toBe(1);
+
+    let authCalls = 0;
+    const authFailFetch = async () => {
+      authCalls++;
+      return new Response(JSON.stringify({ error: { message: "invalid key" } }), { status: 401 });
+    };
+    await expect(
+      classifySessionTurn(
+        { baseUrl: "http://localhost:11434/v1", apiKey: "bad", model: "qwen2.5" },
+        { epic: null, task: null, terminalTail: "", gitStatus: "", gitLog: "", ciSummary: "" },
+        authFailFetch,
+        null,
+        null,
+        { waitOnError: true, sleepFn: async () => {} },
+      ),
+    ).rejects.toThrow(/401/);
+    expect(authCalls).toBe(1);
+  });
 });

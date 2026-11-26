@@ -5,6 +5,8 @@ import { REVIEWER_TOOLS } from "./reviewer_tools.js";
 
 const VALID_VERDICTS = new Set(["completed", "waiting_ci", "needs_fix", "needs_user", "failed"]);
 const MAX_REVIEW_TOOL_ROUNDS = 6;
+const DEFAULT_RETRY_DELAYS_MS = [3000, 5000, 10000, 15000, 30000];
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
 
 const ANSI_OSC_RE = /\u001b\][^\u0007\u001b]*(?:\u0007|\u001b\\)/g;
 const ANSI_CSI_RE = /[\u001b\u009b]\[[0-?]*[ -/]*[@-~]/g;
@@ -28,7 +30,7 @@ export function normalizeBaseUrl(raw) {
   return `${trimmed}/v1`;
 }
 
-function buildHeaders(apiKey, extra = {}) {
+export function buildHeaders(apiKey, extra = {}) {
   const headers = { ...extra };
   const key = typeof apiKey === "string" ? apiKey.trim() : "";
   if (key) {
@@ -37,7 +39,7 @@ function buildHeaders(apiKey, extra = {}) {
   return headers;
 }
 
-async function readErrorDetail(res) {
+export async function readErrorDetail(res) {
   try {
     const text = await res.text();
     if (!text) return res.statusText || "Unknown error";
@@ -96,7 +98,7 @@ export async function fetchModels(cfg, fetchFn = fetch) {
   return [...ids].sort((a, b) => a.localeCompare(b));
 }
 
-function tryParseJsonObject(text) {
+export function tryParseJsonObject(text) {
   if (!text) return null;
   try {
     const parsed = JSON.parse(text);
@@ -275,6 +277,12 @@ export function buildReviewerMessages(ctx, hasTools = false) {
     }
   }
 
+  if (!epic && !task) {
+    parts.push(
+      "Review mode: standalone review of the agent's latest turn/changes (no backlog epic/task attached). Verify the agent's claims in the terminal output against actual code changes and tests.",
+    );
+  }
+
   const cleanTail = tailText(stripAnsi(terminalTail), 8000).trim();
   parts.push(`Terminal tail:\n${cleanTail || "(empty)"}`);
 
@@ -297,6 +305,32 @@ export function buildReviewerMessages(ctx, hasTools = false) {
   ];
 }
 
+function defaultSleep(ms) {
+  if (typeof globalThis.setTimeout === "function") {
+    return new Promise((resolve) => globalThis.setTimeout(resolve, ms));
+  }
+  return Promise.resolve();
+}
+
+async function sleepWithAbort(ms, sleepFn, shouldAbort) {
+  let remaining = Math.max(0, Number(ms) || 0);
+  while (remaining > 0) {
+    if (shouldAbort?.()) {
+      const err = new Error("Aborted");
+      err.aborted = true;
+      throw err;
+    }
+    const step = Math.min(remaining, 500);
+    await sleepFn(step);
+    remaining -= step;
+  }
+  if (shouldAbort?.()) {
+    const err = new Error("Aborted");
+    err.aborted = true;
+    throw err;
+  }
+}
+
 async function postChatCompletion(url, headers, body, fetchFn) {
   return fetchFn(url, {
     method: "POST",
@@ -305,7 +339,117 @@ async function postChatCompletion(url, headers, body, fetchFn) {
   });
 }
 
-async function runSingleShotClassification(url, headers, model, messages, maxTokens, fetchFn) {
+async function raceWithTimeout(promise, timeoutMs, timeoutFn) {
+  if (!(timeoutMs > 0)) return promise;
+  let settled = false;
+  let timerId = null;
+  const timeoutPromise =
+    typeof timeoutFn === "function"
+      ? timeoutFn(timeoutMs).then(() => {
+          if (!settled) {
+            throw new Error(`Request timeout after ${Math.max(1, Math.round(timeoutMs / 1000))}s`);
+          }
+        })
+      : typeof globalThis.setTimeout === "function"
+        ? new Promise((_, reject) => {
+            timerId = globalThis.setTimeout(() => {
+              if (!settled) {
+                reject(new Error(`Request timeout after ${Math.max(1, Math.round(timeoutMs / 1000))}s`));
+              }
+            }, timeoutMs);
+          })
+        : null;
+
+  if (!timeoutPromise) return promise;
+  timeoutPromise.catch(() => {});
+  try {
+    return await Promise.race([promise, timeoutPromise]);
+  } finally {
+    settled = true;
+    if (timerId !== null && typeof globalThis.clearTimeout === "function") {
+      globalThis.clearTimeout(timerId);
+    }
+  }
+}
+
+export async function postAndParseJson(url, headers, body, fetchFn, options = {}) {
+  const waitOnError = Boolean(options?.waitOnError);
+  const sleepFn = typeof options?.sleepFn === "function" ? options.sleepFn : defaultSleep;
+  const timeoutFn = typeof options?.timeoutFn === "function" ? options.timeoutFn : null;
+  const shouldAbort = typeof options?.shouldAbort === "function" ? options.shouldAbort : null;
+  const onRetry = typeof options?.onRetry === "function" ? options.onRetry : null;
+  const timeoutMs =
+    Number.isFinite(Number(options?.timeoutMs)) && Number(options.timeoutMs) >= 0
+      ? Number(options.timeoutMs)
+      : DEFAULT_REQUEST_TIMEOUT_MS;
+  const delays =
+    Array.isArray(options?.retryDelaysMs) && options.retryDelaysMs.length > 0
+      ? options.retryDelaysMs
+      : DEFAULT_RETRY_DELAYS_MS;
+
+  let attempt = 0;
+  for (;;) {
+    if (shouldAbort?.()) {
+      const err = new Error("Aborted");
+      err.aborted = true;
+      throw err;
+    }
+
+    try {
+      const fetchPromise = postChatCompletion(url, headers, body, fetchFn);
+      const res = waitOnError
+        ? await raceWithTimeout(fetchPromise, timeoutMs, timeoutFn)
+        : await fetchPromise;
+
+      if (shouldAbort?.()) {
+        await res.body?.cancel?.().catch(() => {});
+        const err = new Error("Aborted");
+        err.aborted = true;
+        throw err;
+      }
+
+      if (res.status === 400 || res.status === 422) {
+        return { res, data: null };
+      }
+
+      if (!res.ok) {
+        const detail = await readErrorDetail(res);
+        const err = new Error(`Classifier request failed (HTTP ${res.status}): ${detail}`);
+        if (res.status === 401 || res.status === 403) {
+          err.nonRetryable = true;
+        }
+        throw err;
+      }
+
+      const data = await res.json();
+      return { res, data };
+    } catch (err) {
+      if (err?.aborted || shouldAbort?.()) {
+        const abortErr = new Error("Aborted");
+        abortErr.aborted = true;
+        throw abortErr;
+      }
+      if (!waitOnError || err?.nonRetryable) {
+        throw err;
+      }
+      attempt += 1;
+      const delayMs = delays[Math.min(attempt - 1, delays.length - 1)];
+      const reason = String(err?.message ?? err);
+      onRetry?.({ attempt, delayMs, reason });
+      await sleepWithAbort(delayMs, sleepFn, shouldAbort);
+    }
+  }
+}
+
+async function runSingleShotClassification(
+  url,
+  headers,
+  model,
+  messages,
+  maxTokens,
+  fetchFn,
+  options = {},
+) {
   const sendRequest = (withResponseFormat) => {
     const body = {
       model,
@@ -316,13 +460,13 @@ async function runSingleShotClassification(url, headers, model, messages, maxTok
     if (withResponseFormat) {
       body.response_format = { type: "json_object" };
     }
-    return postChatCompletion(url, headers, body, fetchFn);
+    return postAndParseJson(url, headers, body, fetchFn, options);
   };
 
-  let res = await sendRequest(true);
+  let { res, data } = await sendRequest(true);
   if (res.status === 400 || res.status === 422) {
     await res.body?.cancel?.().catch(() => {});
-    res = await sendRequest(false);
+    ({ res, data } = await sendRequest(false));
   }
 
   if (!res.ok) {
@@ -330,7 +474,6 @@ async function runSingleShotClassification(url, headers, model, messages, maxTok
     throw new Error(`Classifier request failed (HTTP ${res.status}): ${detail}`);
   }
 
-  const data = await res.json();
   const content = data?.choices?.[0]?.message?.content ?? "";
   return parseClassifierVerdict(content);
 }
@@ -341,6 +484,7 @@ export async function classifySessionTurn(
   fetchFn = fetch,
   toolExecutor = null,
   onProgress = null,
+  options = {},
 ) {
   const baseUrl = normalizeBaseUrl(cfg?.baseUrl);
   if (!baseUrl) {
@@ -360,13 +504,13 @@ export async function classifySessionTurn(
   const isReviewer = ctx?.reviewMode === "reviewer";
   if (!isReviewer) {
     const messages = buildClassifierMessages(ctx);
-    return runSingleShotClassification(url, headers, model, messages, 400, fetchFn);
+    return runSingleShotClassification(url, headers, model, messages, 400, fetchFn, options);
   }
 
   const hasTools = typeof toolExecutor === "function";
   const messages = buildReviewerMessages(ctx, hasTools);
   if (!hasTools) {
-    return runSingleShotClassification(url, headers, model, messages, 1000, fetchFn);
+    return runSingleShotClassification(url, headers, model, messages, 1000, fetchFn, options);
   }
 
   let useResponseFormat = true;
@@ -383,18 +527,26 @@ export async function classifySessionTurn(
       body.response_format = { type: "json_object" };
     }
 
-    let res = await postChatCompletion(url, headers, body, fetchFn);
+    let { res, data } = await postAndParseJson(url, headers, body, fetchFn, options);
     if ((res.status === 400 || res.status === 422) && useResponseFormat) {
       await res.body?.cancel?.().catch(() => {});
       useResponseFormat = false;
       delete body.response_format;
-      res = await postChatCompletion(url, headers, body, fetchFn);
+      ({ res, data } = await postAndParseJson(url, headers, body, fetchFn, options));
     }
 
     if (res.status === 400 || res.status === 422) {
       await res.body?.cancel?.().catch(() => {});
       const fallbackMessages = buildReviewerMessages(ctx, false);
-      return runSingleShotClassification(url, headers, model, fallbackMessages, 1000, fetchFn);
+      return runSingleShotClassification(
+        url,
+        headers,
+        model,
+        fallbackMessages,
+        1000,
+        fetchFn,
+        options,
+      );
     }
 
     if (!res.ok) {
@@ -402,7 +554,6 @@ export async function classifySessionTurn(
       throw new Error(`Reviewer request failed (HTTP ${res.status}): ${detail}`);
     }
 
-    const data = await res.json();
     const msg = data?.choices?.[0]?.message;
     const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
 
@@ -443,5 +594,5 @@ export async function classifySessionTurn(
     content:
       "Tool inspection budget reached. Return your final JSON verdict now based strictly on the evidence observed so far.",
   });
-  return runSingleShotClassification(url, headers, model, messages, 1000, fetchFn);
+  return runSingleShotClassification(url, headers, model, messages, 1000, fetchFn, options);
 }

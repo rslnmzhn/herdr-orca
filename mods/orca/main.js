@@ -9,6 +9,7 @@ import {
   exec,
   hc,
   home,
+  appHome,
   readTextFile,
   writeTextFile,
   watchFolder,
@@ -48,6 +49,7 @@ import {
   shouldRunAutoCompact,
 } from "./guards.js";
 import { createReviewerToolExecutor, buildReviewFixPrompt } from "./reviewer_tools.js";
+import { checkOrcaUpdate, runOrcaUpdate } from "./updater.js";
 import {
   ORCA_ACTIVE_STATES,
   createSessionState,
@@ -67,6 +69,7 @@ const STORAGE_SETTINGS = "orca.settings";
 const STORAGE_FOLDERS = "orca.folders";
 const STORAGE_MODE = "orca.mode";
 const STORAGE_UI = "orca.ui";
+const STORAGE_UPDATE_SHA = "orca.updateSha";
 
 const SENT_GRACE_MS = 10000;
 const IDLE_DEBOUNCE_MS = 2000;
@@ -238,6 +241,10 @@ export default class Orca extends View {
     this.modelsError = null;
     this.modelPickerOpen = false;
     this.modelFilter = "";
+    this.updating = false;
+    this.updateAvailable = false;
+    this.checkingUpdate = false;
+    this.updateCheckError = null;
 
     this.baseUrlInput = InputState.new({
       placeholder: "https://api.openai.com/v1",
@@ -293,6 +300,7 @@ export default class Orca extends View {
     this.syncSelectedTerminalWithFocus();
     this.publishUiState();
     this.refresh(cx, true);
+    this.checkForUpdates(cx);
 
     cx.timer.every(1000, (cx) => this.onTick(cx));
     cx.timer.every(10000, (cx) => this.onBacklogTimer(cx));
@@ -1153,6 +1161,90 @@ export default class Orca extends View {
     cx.notify();
   }
 
+  checkForUpdates(cx) {
+    if (this.checkingUpdate || this.updating) return;
+    this.checkingUpdate = true;
+    this.updateCheckError = null;
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const knownSha = shared(STORAGE_UPDATE_SHA);
+        const res = await checkOrcaUpdate({
+          appHomeDir: appHome(),
+          knownSha: typeof knownSha === "string" ? knownSha : null,
+          execFn: exec,
+          readTextFileFn: readTextFile,
+          platform: window()?.platform ?? "windows",
+        });
+        if (res.ok) {
+          this.updateAvailable = Boolean(res.available);
+          this.updateCheckError = null;
+          if (res.syncedSha) {
+            setShared(STORAGE_UPDATE_SHA, res.syncedSha);
+          }
+        } else {
+          this.updateAvailable = false;
+          this.updateCheckError = res.error || "Не удалось проверить обновления";
+        }
+      } catch (err) {
+        this.updateAvailable = false;
+        this.updateCheckError = String(err?.message ?? err);
+      } finally {
+        this.checkingUpdate = false;
+        cx.notify();
+      }
+    });
+  }
+
+  updateOrca(cx) {
+    if (this.updating || !this.updateAvailable) return;
+    this.updating = true;
+    const session = this.activeSession();
+    this.addLog(session, "info", "Запуск обновления Orca…");
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const res = await runOrcaUpdate({
+          appHomeDir: appHome(),
+          settings: this.settings,
+          execFn: exec,
+          readTextFileFn: readTextFile,
+          writeTextFileFn: writeTextFile,
+          fetchFn: fetch,
+          platform: window()?.platform ?? "windows",
+          onProgress: (msg) => {
+            this.addLog(this.activeSession(), "info", msg);
+            cx.notify();
+          },
+        });
+        const target = this.activeSession();
+        if (res.ok) {
+          this.updateAvailable = false;
+          if (res.remoteSha) {
+            setShared(STORAGE_UPDATE_SHA, res.remoteSha);
+          }
+          this.addLog(target, "success", res.message || "Orca обновлён");
+          notify({ title: "Orca", body: res.message || "Orca обновлён", level: "success" });
+          playSound("done");
+        } else {
+          this.addLog(target, "error", res.error || "Не удалось обновить Orca");
+          notify({ title: "Ошибка обновления Orca", body: res.error || "Не удалось обновить Orca", level: "error" });
+          playSound("blocked");
+        }
+      } catch (err) {
+        const msg = String(err?.message ?? err);
+        this.addLog(this.activeSession(), "error", `Ошибка обновления: ${msg}`);
+        notify({ title: "Ошибка обновления Orca", body: msg, level: "error" });
+        playSound("blocked");
+      } finally {
+        this.updating = false;
+        cx.notify();
+      }
+    });
+  }
+
   readTerminalAgentStatus(address) {
     if (!address) return "idle";
     const agent = (agents() ?? []).find((a) => a.address === address);
@@ -1309,6 +1401,59 @@ export default class Orca extends View {
     this.dispatchCurrentItem(session, cx);
   }
 
+  reviewCurrentTurn(cx) {
+    this.syncSelectedTerminalWithFocus();
+    const session = this.activeSession();
+    if (!session.terminal || !this.isTerminalLive(session.terminal)) {
+      session.statusReason = "Выберите живую сессию агента";
+      notify({
+        title: "Сессия не выбрана",
+        body: session.statusReason,
+        level: "warning",
+      });
+      cx.notify();
+      return;
+    }
+    if (this.isSessionActive(session)) return;
+
+    const baseUrl = normalizeBaseUrl(this.settings?.baseUrl);
+    const model = this.settings?.model?.trim();
+    if (!baseUrl || !model) {
+      this.settingsOpen = true;
+      session.statusReason = "Укажите Base URL и модель классификатора в настройках";
+      notify({
+        title: "Настройте классификатор",
+        body: session.statusReason,
+        level: "warning",
+      });
+      cx.notify();
+      return;
+    }
+
+    const meta = this.findTerminalMeta(session.terminal);
+    session.boundRun = {
+      spaceId: meta.space?.id ?? session.spaceId ?? null,
+      terminal: session.terminal,
+      backlogDir: null,
+      projectRoot: session.projectRoot || meta.cwd || meta.space?.folder || null,
+      on: session.on ?? meta.on ?? null,
+      standaloneReview: true,
+    };
+    session.currentItem = null;
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.lastVerdict = null;
+    session.statusReason = null;
+    session.pausedFromState = null;
+    this.sessionPickerOpen = false;
+    this.syncWatches(cx);
+
+    this.classifyCurrentTurn(session, cx);
+  }
+
   dispatchCurrentItem(session, cx) {
     const runCtx = session?.boundRun;
     const item = session?.currentItem;
@@ -1395,7 +1540,7 @@ export default class Orca extends View {
     }
 
     session.pausedFromState = null;
-    if (session.currentItem) {
+    if (session.currentItem || session.boundRun?.standaloneReview) {
       session.sentAt = Date.now();
       session.lastAgentStatus = this.readTerminalAgentStatus(session.boundRun.terminal);
       session.sawWorkingSinceSend = session.lastAgentStatus === "working";
@@ -1436,7 +1581,11 @@ export default class Orca extends View {
 
   skipCurrent(cx) {
     const session = this.activeSession();
-    if (!session.boundRun || !session.currentItem) return;
+    if (!session.boundRun) return;
+    if (session.boundRun.standaloneReview || !session.currentItem) {
+      this.stop(cx);
+      return;
+    }
     const key = queueItemKey(session.currentItem);
     if (key) session.skippedKeys.add(key);
 
@@ -1559,10 +1708,12 @@ export default class Orca extends View {
 
   classifyCurrentTurn(session, cx) {
     const runCtx = session?.boundRun;
-    const item = session?.currentItem;
-    if (!runCtx || !item) return;
+    const item = session?.currentItem ?? null;
+    if (!runCtx || (!item && !runCtx.standaloneReview)) return;
 
-    const isReviewer = (this.settings?.reviewMode ?? "reviewer") === "reviewer";
+    const isReviewer =
+      Boolean(runCtx.standaloneReview) ||
+      (this.settings?.reviewMode ?? "reviewer") === "reviewer";
     const seq = ++session.runSeq;
     session.reviewProgress = isReviewer ? "Сбор фактов…" : null;
     this.setSessionState(session, "classifying");
@@ -1570,9 +1721,11 @@ export default class Orca extends View {
     this.addLog(
       session,
       "info",
-      isReviewer
-        ? "Ревьювер проверяет работу агента…"
-        : "Классификация завершения хода агента…",
+      runCtx.standaloneReview
+        ? "Ревью текущего ответа агента…"
+        : isReviewer
+          ? "Ревьювер проверяет работу агента…"
+          : "Классификация завершения хода агента…",
     );
     cx.notify();
 
@@ -1660,7 +1813,7 @@ export default class Orca extends View {
               projectRoot: runCtx.projectRoot,
               terminal: runCtx.terminal,
               on: runCtx.on,
-              epicFilePath: item.epic?.filePath ?? null,
+              epicFilePath: item?.epic?.filePath ?? null,
               execFn: exec,
               hcFn: hc,
               readTextFileFn: readTextFile,
@@ -1680,8 +1833,8 @@ export default class Orca extends View {
           this.settings,
           {
             reviewMode: isReviewer ? "reviewer" : "auto",
-            epic: item.epic,
-            task: item.task,
+            epic: item?.epic ?? null,
+            task: item?.task ?? null,
             terminalTail,
             gitStatus,
             gitLog,
@@ -1691,6 +1844,24 @@ export default class Orca extends View {
           fetch,
           toolExecutor,
           onProgress,
+          {
+            waitOnError: true,
+            sleepFn: (ms) => cx.sleep(ms),
+            timeoutFn: (ms) => cx.sleep(ms),
+            shouldAbort: () => session.runSeq !== seq,
+            onRetry: ({ attempt, delayMs, reason }) => {
+              if (session.runSeq !== seq) return;
+              const sec = Math.max(1, Math.round(delayMs / 1000));
+              session.reviewProgress = `Повтор #${attempt} (${sec}с)…`;
+              session.statusReason = `Ожидание ответа модели (попытка ${attempt}): ${reason}`;
+              this.addLog(
+                session,
+                "warn",
+                `Запрос не прошёл (${reason}) — повтор #${attempt} через ${sec}с`,
+              );
+              cx.notify();
+            },
+          },
         );
         if (session.runSeq !== seq) return;
 
@@ -1711,6 +1882,10 @@ export default class Orca extends View {
           if (ciAction === "fix_ci") {
             session.ciInfo = ci;
             await this.handleCiFailure(session, runCtx, item, ci, seq, cx);
+            return;
+          }
+          if (runCtx.standaloneReview) {
+            this.completeStandaloneReview(session, verdict.reason, cx);
             return;
           }
           await this.markDoneAndAdvance(session, seq, cx);
@@ -1783,8 +1958,8 @@ export default class Orca extends View {
 
       try {
         const fixPrompt = buildReviewFixPrompt(
-          item.epic,
-          item.task,
+          item?.epic ?? null,
+          item?.task ?? null,
           verdict,
           session.reviewRetryCount,
           maxRetries,
@@ -1857,8 +2032,8 @@ export default class Orca extends View {
   runCiCheck(session, cx) {
     if (!session || session.ciChecking) return;
     const runCtx = session.boundRun;
-    const item = session.currentItem;
-    if (!runCtx || !item) return;
+    const item = session.currentItem ?? null;
+    if (!runCtx || (!item && !runCtx.standaloneReview)) return;
 
     if (!runCtx.projectRoot) {
       session.pausedFromState = "waiting_ci";
@@ -1965,8 +2140,8 @@ export default class Orca extends View {
         if (session.runSeq !== seq) return;
 
         const fixPrompt = buildCiFixPrompt(
-          item.epic,
-          item.task,
+          item?.epic ?? null,
+          item?.task ?? null,
           ci,
           logTail,
           session.ciRetryCount,
@@ -2068,8 +2243,13 @@ export default class Orca extends View {
 
   async markDoneAndAdvance(session, seq, cx) {
     const runCtx = session?.boundRun;
-    const item = session?.currentItem;
-    if (!runCtx || !item) return;
+    const item = session?.currentItem ?? null;
+    if (!runCtx) return;
+    if (runCtx.standaloneReview) {
+      this.completeStandaloneReview(session, session.ciInfo?.summary || "CI прошёл успешно", cx);
+      return;
+    }
+    if (!item) return;
 
     this.setSessionState(session, "advancing");
     cx.notify();
@@ -2176,6 +2356,37 @@ export default class Orca extends View {
         session.sendingPrompt = false;
       }
     }
+  }
+
+  completeStandaloneReview(session, reason, cx) {
+    if (!session) return;
+    const terminal = session.boundRun?.terminal ?? session.terminal;
+    session.runSeq++;
+    session.sendingPrompt = false;
+    session.boundRun = null;
+    session.currentItem = null;
+    session.ciRetryCount = 0;
+    session.reviewRetryCount = 0;
+    session.reviewProgress = null;
+    session.ciInfo = null;
+    session.nextCiCheckAt = null;
+    session.statusReason = reason || "Ревью пройдено";
+    session.pausedFromState = null;
+    session.sentAt = 0;
+    session.sawWorkingSinceSend = false;
+    session.idleSince = null;
+    session.lastAgentStatus = null;
+    this.setSessionState(session, "idle");
+    this.syncWatches(cx);
+    this.addLog(session, "success", `Ревью пройдено: ${session.statusReason}`);
+    notify({
+      title: `Orca (${terminal}): ревью пройдено`,
+      body: session.statusReason,
+      level: "success",
+      ...(terminal ? { action: { name: "pane.focus", args: { terminal } } } : {}),
+    });
+    playSound("done");
+    cx.notify();
   }
 
   completeBacklog(session, cx) {

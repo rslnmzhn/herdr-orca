@@ -152,7 +152,8 @@ function iconButton(id, iconName, tip, onClick, t, opts = {}) {
 }
 
 function pillButton(id, label, active, onClick, t, opts = {}) {
-  const fg = active ? (opts.activeFg ?? t.foreground) : (opts.fg ?? t.muted);
+  const disabled = Boolean(opts.disabled);
+  const fg = disabled ? (opts.fg ?? t.dim) : active ? (opts.activeFg ?? t.foreground) : (opts.fg ?? t.muted);
   const bg = active ? (opts.activeBg ?? t.selected) : (opts.bg ?? t.chrome);
   const border = active ? (opts.activeBorder ?? t.border) : (opts.border ?? t.border);
   return h_flex()
@@ -169,14 +170,18 @@ function pillButton(id, label, active, onClick, t, opts = {}) {
     .text_size(opts.textSize ?? 11.5)
     .when(active, (el) => el.font_medium())
     .text_color(fg)
-    .cursor_pointer()
+    .when(disabled, (el) => el.opacity(0.5))
+    .when(!disabled, (el) =>
+      el
+        .cursor_pointer()
+        .hover((s) => s.bg(active ? bg : t.hover).text_color(t.foreground))
+        .on_click((e, cx) => {
+          cx.stop_propagation();
+          onClick(e, cx);
+        }),
+    )
     .when(Boolean(opts.tip), (el) => el.tooltip(opts.tip))
-    .hover((s) => s.bg(active ? bg : t.hover).text_color(t.foreground))
     .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-    .on_click((e, cx) => {
-      cx.stop_propagation();
-      onClick(e, cx);
-    })
     .when(Boolean(opts.icon), (el) =>
       el.child(
         svg(`mods/orca/icons/${opts.icon}.svg`)
@@ -323,11 +328,18 @@ export function renderHeader(view, t) {
         .gap(6)
         .items_center()
         .when(s.state === "idle" || s.state === "error", (el) =>
-          el.child(
-            solidButton("orca-btn-start", "Старт", "play", (_e, cx) => view.start(cx), t, {
-              tip: "Запустить цикл Orca для выбранного агента",
-            }),
-          ),
+          el
+            .child(
+              pillButton("orca-btn-review-now", "Ревью", false, (_e, cx) => view.reviewCurrentTurn(cx), t, {
+                icon: "eye",
+                tip: "Проверить текущий ответ агента без бэклога",
+              }),
+            )
+            .child(
+              solidButton("orca-btn-start", "Старт", "play", (_e, cx) => view.start(cx), t, {
+                tip: "Запустить цикл Orca для выбранного агента",
+              }),
+            ),
         )
         .when(isPaused, (el) =>
           el.child(
@@ -346,11 +358,13 @@ export function renderHeader(view, t) {
         )
         .when(isActive || isPaused, (el) =>
           el
-            .child(
-              pillButton("orca-btn-skip", "Пропустить", false, (_e, cx) => view.skipCurrent(cx), t, {
-                icon: "skip",
-                tip: "Пропустить текущую задачу и перейти к следующей",
-              }),
+            .when(!s.boundRun?.standaloneReview, (b) =>
+              b.child(
+                pillButton("orca-btn-skip", "Пропустить", false, (_e, cx) => view.skipCurrent(cx), t, {
+                  icon: "skip",
+                  tip: "Пропустить текущую задачу и перейти к следующей",
+                }),
+              ),
             )
             .child(
               pillButton("orca-btn-stop", "Стоп", false, (_e, cx) => view.stop(cx), t, {
@@ -794,7 +808,7 @@ export function renderPipelineStrip(view, t) {
         .child(
           renderPipelineStage(
             "orca-stage-classifier",
-            isReviewerMode ? "Ревьювер" : "Классификатор",
+            isReviewerMode || s.boundRun?.standaloneReview ? "Ревьювер" : "Классификатор",
             stage2,
             t,
             {
@@ -905,7 +919,11 @@ export function renderPipelineStrip(view, t) {
             div()
               .text_size(11.5)
               .text_color(t.dim)
-              .child("Текущая задача не выбрана"),
+              .child(
+                s.boundRun?.standaloneReview
+                  ? "Ревью текущего ответа (без бэклога)"
+                  : "Текущая задача не выбрана",
+              ),
           ),
         ),
     )
@@ -1604,6 +1622,40 @@ export function renderFooterAndSettings(view, t) {
               .text_color(t.dim)
               .child(view.settings.baseUrl),
           ),
+        )
+        .when(!view.settings?.baseUrl, (el) => el.child(div().flex_1()))
+        .child(
+          (() => {
+            const canUpdate = Boolean(view.updateAvailable) && !view.updating;
+            const updateTip = view.updating
+              ? "Выполняется обновление Orca…"
+              : view.checkingUpdate
+                ? "Проверка обновлений Orca…"
+                : view.updateAvailable
+                  ? "Доступно обновление Orca — нажмите, чтобы обновить"
+                  : view.updateCheckError
+                    ? `Не удалось проверить обновления: ${view.updateCheckError}`
+                    : "Установлена актуальная версия Orca";
+            return pillButton(
+              "orca-update-btn",
+              view.updating ? "Обновление…" : "Обновить",
+              canUpdate,
+              (_e, cx) => view.updateOrca(cx),
+              t,
+              {
+                icon: view.updating ? "spinner" : "download",
+                spin: view.updating ? 900 : 0,
+                height: 24,
+                px: 8,
+                textSize: 11.5,
+                disabled: !canUpdate,
+                activeFg: t.accent,
+                activeBg: alpha(t.accent, "1c"),
+                activeBorder: alpha(t.accent, "66"),
+                tip: updateTip,
+              },
+            );
+          })(),
         ),
     );
 }
