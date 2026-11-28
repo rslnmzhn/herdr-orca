@@ -12,7 +12,7 @@ import {
 } from "./classifier.js";
 import { resolveSafeRepoPath } from "./reviewer_tools.js";
 
-export const UPSTREAM_REPO = "https://github.com/rslnmzhn/herdr-orca.git";
+export const UPSTREAM_REPO = "git@github.com:domasHka-mods/orca.git";
 const MAX_UPDATE_TOOL_ROUNDS = 10;
 
 const UPDATE_TOOLS = [

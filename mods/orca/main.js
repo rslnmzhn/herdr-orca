@@ -41,6 +41,8 @@ import {
   normalizeBaseUrl,
   fetchModels,
   classifySessionTurn,
+  classifyChatRequest,
+  checkBlockedItemActionable,
   normalizeOptionalReviewChecks,
   getMaxOptionalReviewScore,
   resolveMinReviewScore,
@@ -55,6 +57,7 @@ import {
   resolveStartAction,
   resolveCompletedCiAction,
   shouldRunAutoCompact,
+  shouldAutoResumePaused,
 } from "./guards.js";
 import { createReviewerToolExecutor, buildReviewFixPrompt } from "./reviewer_tools.js";
 import { checkOrcaUpdate, runOrcaUpdate } from "./updater.js";
@@ -81,6 +84,7 @@ const STORAGE_UPDATE_SHA = "orca.updateSha";
 
 const SENT_GRACE_MS = 10000;
 const IDLE_DEBOUNCE_MS = 2000;
+const TESTS_POLL_MS = 30000;
 const MAX_LOGS = 200;
 
 const remoteHomeCache = new Map();
@@ -104,6 +108,9 @@ function normalizeSettings(raw) {
   const ciPollMinutes = Number.isFinite(parsedPoll) && parsedPoll > 0 ? parsedPoll : 5;
   const optionalReviewChecks = normalizeOptionalReviewChecks(obj.optionalReviewChecks);
   const minReviewScore = resolveMinReviewScore(obj.minReviewScore, optionalReviewChecks);
+  const autoResponderEnabled = Boolean(obj.autoResponderEnabled);
+  const autoResponderModel =
+    typeof obj.autoResponderModel === "string" ? obj.autoResponderModel.trim() : "";
   return {
     baseUrl,
     apiKey,
@@ -115,6 +122,8 @@ function normalizeSettings(raw) {
     ciPollMinutes,
     optionalReviewChecks,
     minReviewScore,
+    autoResponderEnabled,
+    autoResponderModel,
   };
 }
 
@@ -276,6 +285,13 @@ export default class Orca extends View {
       value: this.settings.model,
     });
     this.modelInput.on("submit", (_e, cx) => this.saveSettings(cx));
+
+    this.draftAutoResponderEnabled = Boolean(this.settings.autoResponderEnabled);
+    this.autoResponderModelInput = InputState.new({
+      placeholder: "По умолчанию: основная модель",
+      value: this.settings.autoResponderModel,
+    });
+    this.autoResponderModelInput.on("submit", (_e, cx) => this.saveSettings(cx));
 
     this.modelSearchInput = InputState.new({
       placeholder: "Фильтр моделей…",
@@ -669,7 +685,7 @@ export default class Orca extends View {
       return;
     }
     if (!prevTask) {
-      if (session.state === "idle" && (freshEpic.status === "done" || freshEpic.status === "blocked")) {
+      if (session.state === "idle" && freshEpic.status === "done") {
         session.currentItem = null;
       } else {
         session.currentItem = { epic: freshEpic, task: null };
@@ -685,7 +701,7 @@ export default class Orca extends View {
       if (session.state === "idle") session.currentItem = null;
       return;
     }
-    if (session.state === "idle" && (freshTask.status === "done" || freshTask.status === "blocked")) {
+    if (session.state === "idle" && freshTask.status === "done") {
       session.currentItem = null;
       return;
     }
@@ -1025,7 +1041,7 @@ export default class Orca extends View {
         return item;
       }
     }
-    return pickNextQueueItem(session.epics, session.mode);
+    return null;
   }
 
   focusQueueItem(item, cx) {
@@ -1054,6 +1070,8 @@ export default class Orca extends View {
       this.baseUrlInput.set_value(this.settings.baseUrl || "");
       this.apiKeyInput.set_value(this.settings.apiKey || "");
       this.modelInput.set_value(this.settings.model || "");
+      this.draftAutoResponderEnabled = Boolean(this.settings.autoResponderEnabled);
+      this.autoResponderModelInput.set_value(this.settings.autoResponderModel || "");
       this.maxRetriesInput.set_value(String(this.settings.maxCiRetries ?? 3));
       this.maxReviewRetriesInput.set_value(String(this.settings.maxReviewRetries ?? 3));
       this.draftOptionalChecks = normalizeOptionalReviewChecks(this.settings.optionalReviewChecks);
@@ -1086,6 +1104,11 @@ export default class Orca extends View {
       }
     }
     this.modelsError = null;
+    cx.notify();
+  }
+
+  toggleAutoResponder(cx) {
+    this.draftAutoResponderEnabled = !this.draftAutoResponderEnabled;
     cx.notify();
   }
 
@@ -1218,6 +1241,8 @@ export default class Orca extends View {
 
     const model = this.modelInput.value().trim();
     const apiKey = this.apiKeyInput.value();
+    const autoResponderEnabled = Boolean(this.draftAutoResponderEnabled);
+    const autoResponderModel = this.autoResponderModelInput.value().trim();
 
     this.settings = {
       ...this.settings,
@@ -1228,8 +1253,11 @@ export default class Orca extends View {
       maxReviewRetries,
       optionalReviewChecks,
       minReviewScore,
+      autoResponderEnabled,
+      autoResponderModel,
     };
     this.baseUrlInput.set_value(normalizedUrl);
+    this.autoResponderModelInput.set_value(autoResponderModel);
     this.maxRetriesInput.set_value(String(maxCiRetries));
     this.maxReviewRetriesInput.set_value(String(maxReviewRetries));
     this._clampingMinScore = true;
@@ -1465,6 +1493,7 @@ export default class Orca extends View {
     session.currentItem = chosen;
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -1472,6 +1501,7 @@ export default class Orca extends View {
     session.lastVerdict = null;
     session.statusReason = null;
     session.pausedFromState = null;
+    session.autoResumeMode = null;
     this.sessionPickerOpen = false;
     this.syncWatches(cx);
 
@@ -1534,6 +1564,7 @@ export default class Orca extends View {
     session.currentItem = null;
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -1541,6 +1572,7 @@ export default class Orca extends View {
     session.lastVerdict = null;
     session.statusReason = null;
     session.pausedFromState = null;
+    session.autoResumeMode = null;
     this.sessionPickerOpen = false;
     this.syncWatches(cx);
 
@@ -1563,6 +1595,65 @@ export default class Orca extends View {
 
     cx.spawn(async (cx) => {
       try {
+        const itemStatus = item.task?.status ?? item.epic?.status;
+        if (itemStatus === "blocked") {
+          this.addLog(session, "info", `Проверка разблокировки BLOCKED (${label})…`);
+          cx.notify();
+          const [gitStatusRes, gitLogRes] = runCtx.projectRoot
+            ? await Promise.all([
+                exec("git", ["status", "--short"], { cwd: runCtx.projectRoot, on: runCtx.on }).catch(() => null),
+                exec("git", ["log", "-n", "5", "--oneline"], { cwd: runCtx.projectRoot, on: runCtx.on }).catch(() => null),
+              ])
+            : [null, null];
+          if (session.runSeq !== seq) return;
+
+          const check = await checkBlockedItemActionable(
+            {
+              baseUrl: this.settings?.baseUrl,
+              apiKey: this.settings?.apiKey,
+              model: this.settings?.model,
+            },
+            {
+              epic: item.epic,
+              task: item.task,
+              epics: session.epics,
+              gitStatus: gitStatusRes?.code === 0 ? gitStatusRes.stdout : "",
+              gitLog: gitLogRes?.code === 0 ? gitLogRes.stdout : "",
+            },
+          ).catch((err) => ({
+            actionable: false,
+            reason: `Ошибка проверки BLOCKED: ${String(err?.message ?? err)}`,
+          }));
+          if (session.runSeq !== seq) return;
+
+          if (!check.actionable) {
+            const key = queueItemKey(item);
+            if (key) session.skippedKeys.add(key);
+            session.sendingPrompt = false;
+            this.addLog(session, "warn", `Пропуск BLOCKED (${label}): ${check.reason}`);
+            const next = this.pickNextAvailableItem(session);
+            if (next) {
+              session.currentItem = next;
+              this.dispatchCurrentItem(session, cx);
+              return;
+            }
+            session.pausedFromState = null;
+            session.autoResumeMode = null;
+            this.setSessionState(session, "paused");
+            session.statusReason = `Остались только заблокированные задачи (${label}: ${check.reason})`;
+            notify({
+              title: `Orca (${runCtx.terminal}): задачи заблокированы`,
+              body: session.statusReason,
+              level: "warning",
+              action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
+            });
+            playSound("blocked");
+            cx.notify();
+            return;
+          }
+          this.addLog(session, "info", `BLOCKED можно выполнить (${label}): ${check.reason}`);
+        }
+
         await this.markItemStatusOnDisk(item, "in_progress", runCtx.on).catch(() => {});
         await this.reloadEpicsForSession(session, runCtx.backlogDir, runCtx.on).catch(() => {});
         if (session.runSeq !== seq) return;
@@ -1601,10 +1692,12 @@ export default class Orca extends View {
     const session = this.activeSession();
     if (!this.isSessionActive(session)) return;
     session.pausedFromState = session.state;
+    session.autoResumeMode = null;
     session.runSeq++;
     session.sendingPrompt = false;
     session.idleSince = null;
     session.nextCiCheckAt = null;
+    session.nextTestsCheckAt = null;
     session.reviewProgress = null;
     this.setSessionState(session, "paused");
     session.statusReason = "Цикл поставлен на паузу";
@@ -1626,13 +1719,22 @@ export default class Orca extends View {
 
     if (session.pausedFromState === "waiting_ci") {
       session.pausedFromState = null;
+      session.autoResumeMode = null;
       this.setSessionState(session, "waiting_ci");
       this.addLog(session, "info", "Возобновлено ожидание CI");
       this.runCiCheck(session, cx);
       return;
     }
 
+    if (session.pausedFromState === "waiting_tests") {
+      session.pausedFromState = null;
+      session.autoResumeMode = null;
+      this.enterWaitingTests(session, "Возобновлено ожидание тестов", cx);
+      return;
+    }
+
     session.pausedFromState = null;
+    session.autoResumeMode = null;
     if (session.currentItem || session.boundRun?.standaloneReview) {
       session.sentAt = Date.now();
       session.lastAgentStatus = this.readTerminalAgentStatus(session.boundRun.terminal);
@@ -1655,6 +1757,7 @@ export default class Orca extends View {
     session.skippedKeys.clear();
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -1662,6 +1765,7 @@ export default class Orca extends View {
     session.lastVerdict = null;
     session.statusReason = null;
     session.pausedFromState = null;
+    session.autoResumeMode = null;
     session.sentAt = 0;
     session.sawWorkingSinceSend = false;
     session.idleSince = null;
@@ -1690,6 +1794,7 @@ export default class Orca extends View {
 
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -1741,6 +1846,60 @@ export default class Orca extends View {
         continue;
       }
 
+      if (session.state === "waiting_tests") {
+        const terminal = session.boundRun?.terminal ?? session.terminal;
+        if (!terminal || !this.isTerminalLive(terminal)) {
+          this.failRun(session, `Терминал ${terminal ?? ""} завершился или недоступен`, cx);
+          continue;
+        }
+        const status = this.readTerminalAgentStatus(terminal);
+        if (status === "blocked") {
+          this.handleChatRequestOrPause(
+            session,
+            "blocked",
+            "Агент ожидает ответа пользователя (blocked)",
+            cx,
+          );
+          shouldNotify = true;
+          continue;
+        }
+        if (status === "working") {
+          session.nextTestsCheckAt = null;
+          session.sawWorkingSinceSend = true;
+          session.idleSince = null;
+          session.lastAgentStatus = "working";
+          this.setSessionState(session, "watching");
+          this.addLog(session, "info", "Агент возобновил работу — ожидание завершения");
+          shouldNotify = true;
+          continue;
+        }
+        if (session.nextTestsCheckAt && Date.now() >= session.nextTestsCheckAt) {
+          session.nextTestsCheckAt = null;
+          this.classifyCurrentTurn(session, cx);
+        }
+        continue;
+      }
+
+      if (session.state === "paused" && session.autoResumeMode) {
+        const terminal = session.boundRun?.terminal ?? session.terminal;
+        if (terminal && this.isTerminalLive(terminal)) {
+          const status = this.readTerminalAgentStatus(terminal);
+          if (shouldAutoResumePaused(session.autoResumeMode, status)) {
+            const nextState = session.pausedFromState === "fixing_ci" ? "fixing_ci" : "watching";
+            session.pausedFromState = null;
+            session.autoResumeMode = null;
+            session.statusReason = null;
+            session.idleSince = null;
+            session.sentAt = Date.now();
+            session.lastAgentStatus = status;
+            session.sawWorkingSinceSend = true;
+            this.setSessionState(session, nextState);
+            this.addLog(session, "info", "Ответ получен — ожидание продолжено");
+            shouldNotify = true;
+          }
+        }
+      }
+
       if (session.state !== "watching" && session.state !== "fixing_ci") {
         continue;
       }
@@ -1756,19 +1915,12 @@ export default class Orca extends View {
 
       const status = this.readTerminalAgentStatus(terminal);
       if (status === "blocked") {
-        session.pausedFromState = session.state;
-        session.runSeq++;
-        session.idleSince = null;
-        this.setSessionState(session, "paused");
-        session.statusReason = "Агент ожидает ответа пользователя (blocked)";
-        this.addLog(session, "warn", session.statusReason);
-        notify({
-          title: `Orca (${terminal}): требуется внимание`,
-          body: session.statusReason,
-          level: "warning",
-          action: { name: "pane.focus", args: { terminal } },
-        });
-        playSound("blocked");
+        this.handleChatRequestOrPause(
+          session,
+          "blocked",
+          "Агент ожидает ответа пользователя (blocked)",
+          cx,
+        );
         shouldNotify = true;
         continue;
       }
@@ -1799,6 +1951,107 @@ export default class Orca extends View {
     if (shouldNotify) {
       cx.notify();
     }
+  }
+
+  handleChatRequestOrPause(session, trigger, reason, cx) {
+    const terminal = session.boundRun?.terminal ?? session.terminal;
+    const prevState = session.state === "fixing_ci" ? "fixing_ci" : "watching";
+    const pauseForUser = (pauseReason) => {
+      session.pausedFromState = prevState;
+      session.autoResumeMode = trigger;
+      session.runSeq++;
+      session.idleSince = null;
+      session.reviewProgress = null;
+      this.setSessionState(session, "paused");
+      session.statusReason = pauseReason || reason || "Требуется участие пользователя";
+      this.addLog(session, "warn", session.statusReason);
+      notify({
+        title: `Orca (${terminal}): требуется внимание`,
+        body: session.statusReason,
+        level: "warning",
+        action: { name: "pane.focus", args: { terminal } },
+      });
+      playSound("blocked");
+      cx.notify();
+    };
+
+    const model = (this.settings?.autoResponderModel || this.settings?.model || "").trim();
+    const baseUrl = normalizeBaseUrl(this.settings?.baseUrl);
+    if (
+      !this.settings?.autoResponderEnabled ||
+      !baseUrl ||
+      !model ||
+      !terminal ||
+      (session.autoReplyCount || 0) >= 12
+    ) {
+      const limitNote =
+        this.settings?.autoResponderEnabled && (session.autoReplyCount || 0) >= 12
+          ? "Достигнут лимит авто-ответов (12) — требуется участие пользователя"
+          : reason;
+      pauseForUser(limitNote);
+      return;
+    }
+
+    const seq = ++session.runSeq;
+    session.idleSince = null;
+    session.reviewProgress = "Классификация запроса в чате…";
+    this.setSessionState(session, "classifying");
+    this.addLog(session, "info", `Классификация запроса в чате (${model})…`);
+    cx.notify();
+
+    cx.spawn(async (cx) => {
+      try {
+        const readRes = await hc(["read", terminal, "--lines", "120"]).catch(() => null);
+        if (session.runSeq !== seq) return;
+        const terminalOutput = readRes?.code === 0 ? String(readRes.stdout ?? "") : "";
+        const item = session.currentItem ?? null;
+        const decision = await classifyChatRequest(
+          {
+            baseUrl,
+            apiKey: this.settings.apiKey,
+            model,
+          },
+          {
+            trigger,
+            reason,
+            epicTitle: item?.epic?.title ?? null,
+            taskTitle: item?.task?.title ?? null,
+            taskBody: item?.task?.body ?? item?.epic?.body ?? null,
+            terminalOutput,
+          },
+        );
+        if (session.runSeq !== seq) return;
+        session.reviewProgress = null;
+
+        if (decision.action === "respond") {
+          const sendRes = await hc(["send", terminal, decision.reply]).catch((e) => ({
+            code: 1,
+            stderr: String(e),
+          }));
+          if (session.runSeq !== seq) return;
+          if (sendRes.code === 0) {
+            session.autoReplyCount = (session.autoReplyCount || 0) + 1;
+            session.sentAt = Date.now();
+            session.lastAgentStatus = this.readTerminalAgentStatus(terminal);
+            session.sawWorkingSinceSend = session.lastAgentStatus === "working";
+            session.idleSince = null;
+            this.setSessionState(session, prevState);
+            const shownReply = decision.reply === "" ? "<Enter>" : decision.reply;
+            this.addLog(session, "info", `Авто-ответ (${shownReply}): ${decision.reason}`);
+            cx.notify();
+            return;
+          }
+          pauseForUser(`Не удалось отправить авто-ответ: ${sendRes.stderr || "ошибка hc send"}`);
+          return;
+        }
+
+        pauseForUser(decision.reason || reason);
+      } catch (err) {
+        if (session.runSeq !== seq) return;
+        session.reviewProgress = null;
+        pauseForUser(`${reason} (авто-классификатор: ${String(err?.message ?? err)})`);
+      }
+    });
   }
 
   classifyCurrentTurn(session, cx) {
@@ -2007,6 +2260,11 @@ export default class Orca extends View {
           return;
         }
 
+        if (verdict.verdict === "waiting_tests") {
+          this.enterWaitingTests(session, verdict.reason || "Ожидание завершения тестов", cx);
+          return;
+        }
+
         if (verdict.verdict === "waiting_ci") {
           session.ciInfo =
             ci.state !== "none"
@@ -2020,21 +2278,25 @@ export default class Orca extends View {
           return;
         }
 
+        if (verdict.verdict !== "failed") {
+          this.handleChatRequestOrPause(
+            session,
+            "needs_user",
+            verdict.reason || "Требуется участие пользователя",
+            cx,
+          );
+          return;
+        }
+
         session.pausedFromState = "watching";
+        session.autoResumeMode = null;
         this.setSessionState(session, "paused");
-        session.statusReason =
-          verdict.reason ||
-          (verdict.verdict === "failed"
-            ? "Агент завершился с ошибкой"
-            : "Требуется участие пользователя");
-        this.addLog(session, verdict.verdict === "failed" ? "error" : "warn", session.statusReason);
+        session.statusReason = verdict.reason || "Агент завершился с ошибкой";
+        this.addLog(session, "error", session.statusReason);
         notify({
-          title:
-            verdict.verdict === "failed"
-              ? `Orca (${runCtx.terminal}): ошибка агента`
-              : `Orca (${runCtx.terminal}): требуется ответ`,
+          title: `Orca (${runCtx.terminal}): ошибка агента`,
           body: session.statusReason,
-          level: verdict.verdict === "failed" ? "error" : "warning",
+          level: "error",
           action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
         });
         playSound("blocked");
@@ -2129,6 +2391,14 @@ export default class Orca extends View {
       action: { name: "pane.focus", args: { terminal: runCtx.terminal } },
     });
     playSound("blocked");
+    cx.notify();
+  }
+
+  enterWaitingTests(session, reason, cx) {
+    session.nextTestsCheckAt = Date.now() + TESTS_POLL_MS;
+    session.statusReason = reason || "Ожидание завершения тестов";
+    this.setSessionState(session, "waiting_tests");
+    this.addLog(session, "info", `${session.statusReason} (повторная проверка через 30 с)`);
     cx.notify();
   }
 
@@ -2387,6 +2657,7 @@ export default class Orca extends View {
 
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -2490,6 +2761,7 @@ export default class Orca extends View {
     session.currentItem = null;
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -2522,6 +2794,7 @@ export default class Orca extends View {
     session.skippedKeys.clear();
     session.ciRetryCount = 0;
     session.reviewRetryCount = 0;
+    session.autoReplyCount = 0;
     session.reviewProgress = null;
     session.reviewHistory = [];
     session.ciInfo = null;
@@ -2529,6 +2802,7 @@ export default class Orca extends View {
     session.lastVerdict = null;
     session.statusReason = null;
     session.pausedFromState = null;
+    session.autoResumeMode = null;
     session.sentAt = 0;
     session.sawWorkingSinceSend = false;
     session.idleSince = null;

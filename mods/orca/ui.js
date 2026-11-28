@@ -34,6 +34,14 @@ export function statusMeta(t, state) {
         spinning: true,
         pulsing: false,
       };
+    case "waiting_tests":
+      return {
+        label: "Ожидание тестов",
+        color: t.ansi3 ?? t.working ?? t.accent,
+        icon: "clock",
+        spinning: false,
+        pulsing: true,
+      };
     case "waiting_ci":
       return {
         label: "Ожидание CI",
@@ -772,7 +780,7 @@ export function renderPipelineStrip(view, t) {
   } else if (state === "classifying") {
     stage1 = "done";
     stage2 = "active";
-  } else if (state === "waiting_ci" || state === "advancing") {
+  } else if (state === "waiting_tests" || state === "waiting_ci" || state === "advancing") {
     stage1 = "done";
     stage2 = "done";
     stage3 = "active";
@@ -1109,6 +1117,7 @@ export function renderQueueAndLog(view, t) {
                     const isCurrent = isSameQueueItem(item, s.currentItem);
                     const itemId = task ? task.id : epic.id;
                     const itemTitle = task ? task.title : epic.title;
+                    const isBlocked = (task?.status ?? epic.status) === "blocked";
                     return h_flex()
                       .id(`orca-q-${idx}-${epic.id}-${task?.lineIndex ?? "e"}`)
                       .px(9)
@@ -1156,6 +1165,15 @@ export function renderQueueAndLog(view, t) {
                           .when(isCurrent, (s) => s.font_medium())
                           .text_color(t.foreground)
                           .child(itemTitle),
+                      )
+                      .when(isBlocked, (el) =>
+                        el.child(
+                          badge(
+                            "BLOCKED",
+                            t.blocked ?? t.ansi1,
+                            alpha(t.blocked ?? t.ansi1, "20"),
+                          ),
+                        ),
                       )
                       .when(isCurrent, (el) =>
                         el
@@ -1563,6 +1581,46 @@ export function renderFooterAndSettings(view, t) {
                       .text_size(10.5)
                       .text_color(t.dim)
                       .child("0 = бесконечно, по умолчанию 3"),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .id("orca-auto-responder-settings")
+                  .p(8)
+                  .gap(8)
+                  .items_end()
+                  .flex_wrap()
+                  .rounded(7)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.background)
+                  .child(
+                    pillButton(
+                      "orca-toggle-auto-responder",
+                      view.draftAutoResponderEnabled ? "Авто-ответчик: ВКЛ" : "Авто-ответчик: ВЫКЛ",
+                      Boolean(view.draftAutoResponderEnabled),
+                      (_e, cx) => view.toggleAutoResponder(cx),
+                      t,
+                      {
+                        icon: view.draftAutoResponderEnabled ? "check" : "pause",
+                        height: 28,
+                        px: 10,
+                        tip: "Автоматически классифицировать и отвечать на безопасные запросы подтверждения и вопросы в чате (как auto-mode в Claude CLI)",
+                      },
+                    ),
+                  )
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(180)
+                      .gap(3)
+                      .child(
+                        div()
+                          .text_size(10.5)
+                          .text_color(t.muted)
+                          .child("Модель классификатора чата (опционально)"),
+                      )
+                      .child(renderInputBox("orca-input-auto-responder-model", view.autoResponderModelInput, t)),
                   ),
               )
               .child(

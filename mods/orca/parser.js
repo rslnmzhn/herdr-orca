@@ -584,7 +584,7 @@ export function listQueueItems(epics, mode = "tasks", scopeEpicFile = null) {
   const activeEpics = epics
     .filter((epic) => {
       if (!epic) return false;
-      if (epic.status === "done" || epic.status === "blocked") return false;
+      if (epic.status === "done") return false;
       if (scopeEpicFile && epic.filePath !== scopeEpicFile) return false;
       return true;
     })
@@ -597,11 +597,10 @@ export function listQueueItems(epics, mode = "tasks", scopeEpicFile = null) {
   const items = [];
   for (const epic of activeEpics) {
     const openTasks = (epic.tasks ?? [])
-      .filter((t) => t.status === "in_progress" || t.status === "todo")
+      .filter((t) => t.status === "in_progress" || t.status === "todo" || t.status === "blocked")
       .sort((a, b) => {
-        const rankA = a.status === "in_progress" ? 0 : 1;
-        const rankB = b.status === "in_progress" ? 0 : 1;
-        return rankA - rankB || (a.index ?? 0) - (b.index ?? 0);
+        const rank = (s) => (s === "in_progress" ? 0 : s === "todo" ? 1 : 2);
+        return rank(a.status) - rank(b.status) || (a.index ?? 0) - (b.index ?? 0);
       });
     for (const task of openTasks) {
       items.push({ epic, task });

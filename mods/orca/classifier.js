@@ -3,7 +3,14 @@
 
 import { REVIEWER_TOOLS } from "./reviewer_tools.js";
 
-const VALID_VERDICTS = new Set(["completed", "waiting_ci", "needs_fix", "needs_user", "failed"]);
+const VALID_VERDICTS = new Set([
+  "completed",
+  "waiting_tests",
+  "waiting_ci",
+  "needs_fix",
+  "needs_user",
+  "failed",
+]);
 const VALID_CHECK_STATUSES = new Set(["pass", "partial", "fail", "na"]);
 const MAX_REVIEW_TOOL_ROUNDS = 6;
 const DEFAULT_RETRY_DELAYS_MS = [3000, 5000, 10000, 15000, 30000];
@@ -251,10 +258,24 @@ export async function fetchModels(cfg, fetchFn = fetch) {
   return [...ids].sort((a, b) => a.localeCompare(b));
 }
 
+export function extractMessageContent(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((part) => part && typeof part === "object" && part.type !== "thinking")
+      .map((part) => (typeof part.text === "string" ? part.text : ""))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return "";
+}
+
 export function tryParseJsonObject(text) {
   if (!text) return null;
+  const cleaned = String(text).replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  if (!cleaned) return null;
   try {
-    const parsed = JSON.parse(text);
+    const parsed = JSON.parse(cleaned);
     if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
       return parsed;
     }
@@ -262,7 +283,7 @@ export function tryParseJsonObject(text) {
     // Try fenced or embedded JSON below.
   }
 
-  const fenceMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const fenceMatch = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
   if (fenceMatch) {
     try {
       const parsed = JSON.parse(fenceMatch[1].trim());
@@ -274,20 +295,67 @@ export function tryParseJsonObject(text) {
     }
   }
 
-  const firstBrace = text.indexOf("{");
-  const lastBrace = text.lastIndexOf("}");
+  const firstBrace = cleaned.indexOf("{");
+  const lastBrace = cleaned.lastIndexOf("}");
   if (firstBrace !== -1 && lastBrace > firstBrace) {
     try {
-      const parsed = JSON.parse(text.slice(firstBrace, lastBrace + 1));
+      const parsed = JSON.parse(cleaned.slice(firstBrace, lastBrace + 1));
       if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
         return parsed;
       }
     } catch {
-      return null;
+      // Scan balanced JSON objects from the end in case earlier text had braces.
     }
   }
 
-  return null;
+  let fallbackObj = null;
+  for (let end = cleaned.lastIndexOf("}"); end !== -1; end = cleaned.lastIndexOf("}", end - 1)) {
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let i = end; i >= 0; i--) {
+      const ch = cleaned[i];
+      if (inStr) {
+        if (esc) {
+          esc = false;
+        } else if (ch === "\\") {
+          esc = true;
+        } else if (ch === '"') {
+          inStr = false;
+        }
+        continue;
+      }
+      if (ch === '"') {
+        inStr = true;
+      } else if (ch === "}") {
+        depth++;
+      } else if (ch === "{") {
+        depth--;
+        if (depth === 0) {
+          try {
+            const parsed = JSON.parse(cleaned.slice(i, end + 1));
+            if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+              if (
+                "state" in parsed ||
+                "verdict" in parsed ||
+                "checks" in parsed ||
+                "action" in parsed ||
+                "reason" in parsed
+              ) {
+                return parsed;
+              }
+              if (!fallbackObj) fallbackObj = parsed;
+            }
+          } catch {
+            // Keep scanning earlier objects.
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  return fallbackObj;
 }
 
 function normalizeCheckStatus(raw) {
@@ -422,20 +490,43 @@ export function parseClassifierVerdict(rawText, reviewConfig = null) {
 
   const rawState = typeof obj.state === "string" ? obj.state.trim().toLowerCase() : "";
   const rawVerdict = typeof obj.verdict === "string" ? obj.verdict.trim().toLowerCase() : "";
+  const hasChecks = obj.checks && typeof obj.checks === "object" && !Array.isArray(obj.checks);
+  const rawReason =
+    typeof obj.reason === "string" && obj.reason.trim()
+      ? obj.reason.trim()
+      : typeof obj.summary === "string" && obj.summary.trim()
+        ? obj.summary.trim()
+        : "";
+
+  if (!rawState && !rawVerdict && !hasChecks && !rawReason) {
+    return {
+      verdict: "needs_user",
+      reason: "Не удалось разобрать ответ классификатора",
+    };
+  }
+
   const processState =
-    rawState === "waiting_ci" || rawState === "needs_user" || rawState === "failed"
+    rawState === "waiting_ci" ||
+    rawState === "waiting_tests" ||
+    rawState === "needs_user" ||
+    rawState === "failed"
       ? rawState
-      : rawVerdict === "waiting_ci" || rawVerdict === "needs_user" || rawVerdict === "failed"
+      : rawVerdict === "waiting_ci" ||
+          rawVerdict === "waiting_tests" ||
+          rawVerdict === "needs_user" ||
+          rawVerdict === "failed"
         ? rawVerdict
         : null;
 
-  const reason =
-    typeof obj.reason === "string" && obj.reason.trim()
-      ? obj.reason.trim()
-      : "Классификатор не указал причину";
+  const reason = rawReason || "Классификатор не указал причину";
+  const fallbackVerdict = VALID_VERDICTS.has(rawVerdict)
+    ? rawVerdict
+    : VALID_VERDICTS.has(rawState)
+      ? rawState
+      : "needs_user";
 
   const result = {
-    verdict: processState ?? (VALID_VERDICTS.has(rawVerdict) ? rawVerdict : "needs_user"),
+    verdict: processState ?? fallbackVerdict,
     reason,
   };
 
@@ -495,11 +586,12 @@ export function buildClassifierMessages(ctx) {
   const systemPrompt = [
     "You classify the latest turn of an autonomous coding agent in a terminal.",
     "Choose exactly one verdict:",
-    '- "completed": the assigned task/epic is finished and verified, with no pending CI wait or user question.',
-    '- "waiting_ci": the agent pushed changes or triggered CI and is waiting for CI/checks to complete.',
+    '- "completed": the assigned task/epic is finished and verified, with no pending tests, CI wait, or user question.',
+    '- "waiting_tests": the agent started local tests/build/checks (or is waiting for a local test run to finish) and has NOT pushed to remote CI.',
+    '- "waiting_ci": the agent pushed changes or triggered remote CI (GitHub Actions / PR checks) and is waiting for remote CI to complete.',
     '- "needs_user": the agent is asking the user a question, requesting approval/input, or the outcome is unclear.',
     '- "failed": the agent hit a fatal error, aborted, or left failing tests/build without continuing.',
-    'Respond strictly with a single JSON object: {"verdict":"completed|waiting_ci|needs_user|failed","reason":"concise explanation","ci_ref":"optional branch or PR ref"}.',
+    'Respond strictly with a single JSON object: {"verdict":"completed|waiting_tests|waiting_ci|needs_user|failed","reason":"concise explanation","ci_ref":"optional branch or PR ref"}.',
   ].join("\n");
 
   const parts = [];
@@ -626,12 +718,13 @@ export function buildReviewerMessages(ctx, hasTools = false) {
     "",
     "5. Choose `state`:",
     '   - "reviewed": you completed the rubric evaluation above (host decides completed vs needs_fix from `checks`).',
-    '   - "waiting_ci": changes look solid and were pushed/triggered CI, and CI checks are still running.',
+    '   - "waiting_tests": the agent started local tests/build/checks (or is waiting for a local test run to finish) and has NOT pushed to remote CI.',
+    '   - "waiting_ci": changes look solid and were pushed/triggered remote CI (GitHub Actions / PR checks), and remote CI checks are still running.',
     '   - "needs_user": the agent is asking the user a question, needs credentials/approval, or evidence is genuinely ambiguous.',
     '   - "failed": fatal unrecoverable error or aborted run.',
     "",
     "Respond strictly with a single JSON object (reason, check notes, and issues in Russian):",
-    '{"state":"reviewed|waiting_ci|needs_user|failed","reason":"concise verdict summary in Russian","checks":{"<check_id>":{"status":"pass|partial|fail|na","note":"short factual note in Russian"}},"evidence":["concrete file:line or observed command output"],"issues":["specific actionable defect to fix if any check failed or scored partial"],"ci_ref":"optional branch or PR ref"}',
+    '{"state":"reviewed|waiting_tests|waiting_ci|needs_user|failed","reason":"concise verdict summary in Russian","checks":{"<check_id>":{"status":"pass|partial|fail|na","note":"short factual note in Russian"}},"evidence":["concrete file:line or observed command output"],"issues":["specific actionable defect to fix if any check failed or scored partial"],"ci_ref":"optional branch or PR ref"}',
   ].join("\n");
 
   const parts = [];
@@ -855,8 +948,134 @@ async function runSingleShotClassification(
     throw new Error(`Classifier request failed (HTTP ${res.status}): ${detail}`);
   }
 
-  const content = data?.choices?.[0]?.message?.content ?? "";
+  let choice = data?.choices?.[0];
+  let content = extractMessageContent(choice?.message?.content);
+  if (choice?.finish_reason === "length" && !tryParseJsonObject(content)) {
+    const retryBody = {
+      model,
+      messages: [
+        ...messages,
+        {
+          role: "user",
+          content: "Output ONLY the final JSON object now with concise notes.",
+        },
+      ],
+      temperature: 0,
+      max_tokens: Math.max(maxTokens * 2, 16384),
+    };
+    const retry = await postAndParseJson(url, headers, retryBody, fetchFn, options);
+    if (retry.res.ok) {
+      content = extractMessageContent(retry.data?.choices?.[0]?.message?.content);
+    } else {
+      await retry.res.body?.cancel?.().catch(() => {});
+    }
+  }
   return parseClassifierVerdict(content, reviewConfig);
+}
+
+export function parseChatAutoResponse(rawText) {
+  const text = String(rawText ?? "").trim();
+  const obj = tryParseJsonObject(text);
+  if (!obj) {
+    return {
+      action: "escalate",
+      reply: "",
+      reason: "Не удалось разобрать ответ авто-классификатора",
+    };
+  }
+
+  const rawAction = typeof obj.action === "string" ? obj.action.trim().toLowerCase() : "";
+  const hasReply = typeof obj.reply === "string";
+  const action = rawAction === "respond" && hasReply ? "respond" : "escalate";
+  const reply = hasReply ? obj.reply : "";
+  const reason =
+    typeof obj.reason === "string" && obj.reason.trim()
+      ? obj.reason.trim()
+      : action === "respond"
+        ? "Авто-ответ классификатора"
+        : "Требуется решение пользователя";
+
+  return { action, reply, reason };
+}
+
+export async function classifyChatRequest(cfg, ctx, fetchFn = fetch, options = {}) {
+  const baseUrl = normalizeBaseUrl(cfg?.baseUrl);
+  if (!baseUrl) {
+    throw new Error("Base URL is required");
+  }
+  const model = typeof cfg?.model === "string" ? cfg.model.trim() : "";
+  if (!model) {
+    throw new Error("Model is required");
+  }
+
+  const url = `${baseUrl}/chat/completions`;
+  const headers = buildHeaders(cfg?.apiKey, {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  });
+
+  const systemPrompt = [
+    "You are an auto-mode safety & chat-request classifier for an autonomous coding agent (like Claude CLI auto-mode).",
+    "The agent in the terminal is paused waiting for user confirmation, tool permission, or an answer to a question.",
+    "Decide whether to auto-respond safely or escalate to the human user.",
+    "",
+    "Respond with action='respond' ONLY when the request is safe and within the current task scope:",
+    "- Routine tool/permission prompts: reading/editing project files, running tests/linters/builds, git status/diff/add/commit on a feature branch, installing project dependencies.",
+    "- Straightforward technical or clarifying questions that can be answered directly from the task context.",
+    "",
+    "Respond with action='escalate' when:",
+    "- Destructive or irreversible actions: rm -rf outside project, git push --force, dropping databases, modifying system files/secrets/credentials, billing/external deploys.",
+    "- Product, UX, or architectural decisions that genuinely require human preference.",
+    "- The terminal prompt is unclear or you are not confident what input is expected.",
+    "",
+    "For 'reply':",
+    "- For numbered confirmation menus (e.g. '1. Yes', '2. Yes, allow...'), use '1' (or '' if Enter alone confirms the highlighted default).",
+    "- For [Y/n] or (y/n) prompts, use 'y'.",
+    "- For chat questions, write a concise, direct answer in the language of the conversation.",
+    "",
+    'Respond strictly with a single JSON object: {"action":"respond|escalate","reply":"text to send","reason":"short explanation in Russian"}.',
+  ].join("\n");
+
+  const userParts = [
+    `Trigger: ${ctx?.trigger || "blocked"}`,
+    ctx?.reason ? `Reviewer note: ${ctx.reason}` : null,
+    ctx?.epicTitle ? `Epic: ${ctx.epicTitle}` : null,
+    ctx?.taskTitle ? `Task: ${ctx.taskTitle}` : null,
+    ctx?.taskBody ? `Task details:\n${String(ctx.taskBody).slice(0, 1500)}` : null,
+    `Recent terminal output:\n${String(ctx?.terminalOutput ?? "").slice(-6000)}`,
+  ].filter(Boolean);
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userParts.join("\n\n") },
+  ];
+
+  const sendRequest = (withResponseFormat) => {
+    const body = {
+      model,
+      messages,
+      temperature: 0,
+      max_tokens: 1500,
+    };
+    if (withResponseFormat) {
+      body.response_format = { type: "json_object" };
+    }
+    return postAndParseJson(url, headers, body, fetchFn, options);
+  };
+
+  let { res, data } = await sendRequest(true);
+  if (res.status === 400 || res.status === 422) {
+    await res.body?.cancel?.().catch(() => {});
+    ({ res, data } = await sendRequest(false));
+  }
+
+  if (!res.ok) {
+    const detail = await readErrorDetail(res);
+    throw new Error(`Auto-responder request failed (HTTP ${res.status}): ${detail}`);
+  }
+
+  const content = extractMessageContent(data?.choices?.[0]?.message?.content);
+  return parseChatAutoResponse(content);
 }
 
 export async function classifySessionTurn(
@@ -897,7 +1116,7 @@ export async function classifySessionTurn(
       headers,
       model,
       messages,
-      1600,
+      8192,
       fetchFn,
       options,
       reviewConfig,
@@ -910,7 +1129,7 @@ export async function classifySessionTurn(
       model,
       messages,
       temperature: 0,
-      max_tokens: 1600,
+      max_tokens: 8192,
       tools: REVIEWER_TOOLS,
       tool_choice: "auto",
     };
@@ -934,7 +1153,7 @@ export async function classifySessionTurn(
         headers,
         model,
         fallbackMessages,
-        1600,
+        8192,
         fetchFn,
         options,
         reviewConfig,
@@ -946,11 +1165,29 @@ export async function classifySessionTurn(
       throw new Error(`Reviewer request failed (HTTP ${res.status}): ${detail}`);
     }
 
-    const msg = data?.choices?.[0]?.message;
+    const choice = data?.choices?.[0];
+    const msg = choice?.message;
     const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
 
     if (toolCalls.length === 0) {
-      return parseClassifierVerdict(msg?.content ?? "", reviewConfig);
+      const content = extractMessageContent(msg?.content);
+      if (choice?.finish_reason === "length" && !tryParseJsonObject(content)) {
+        messages.push({
+          role: "user",
+          content: "Output ONLY the final JSON object now with concise notes.",
+        });
+        return runSingleShotClassification(
+          url,
+          headers,
+          model,
+          messages,
+          16384,
+          fetchFn,
+          options,
+          reviewConfig,
+        );
+      }
+      return parseClassifierVerdict(content, reviewConfig);
     }
 
     messages.push({
@@ -991,9 +1228,105 @@ export async function classifySessionTurn(
     headers,
     model,
     messages,
-    1600,
+    8192,
     fetchFn,
     options,
     reviewConfig,
   );
+}
+
+export function parseBlockedCheckResponse(rawText) {
+  const text = extractMessageContent(rawText).trim();
+  const obj = tryParseJsonObject(text);
+  if (!obj) {
+    return {
+      actionable: false,
+      reason: "Не удалось определить, снята ли блокировка задачи",
+    };
+  }
+  const actionable = obj.actionable === true;
+  const reason =
+    typeof obj.reason === "string" && obj.reason.trim()
+      ? obj.reason.trim()
+      : actionable
+        ? "Блокировка снята, задачу можно выполнять"
+        : "Задача всё ещё заблокирована";
+  return { actionable, reason };
+}
+
+export async function checkBlockedItemActionable(cfg, ctx, fetchFn = fetch, options = {}) {
+  const baseUrl = normalizeBaseUrl(cfg?.baseUrl);
+  const model = typeof cfg?.model === "string" ? cfg.model.trim() : "";
+  if (!baseUrl || !model) {
+    return {
+      actionable: false,
+      reason: "Нет настроенной модели для проверки разблокировки BLOCKED-задачи",
+    };
+  }
+
+  const url = `${baseUrl}/chat/completions`;
+  const headers = buildHeaders(cfg?.apiKey, {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  });
+
+  const epic = ctx?.epic ?? null;
+  const task = ctx?.task ?? null;
+  const epicsSummary = Array.isArray(ctx?.epics)
+    ? ctx.epics
+        .map((e) => `${e.id} [${e.status}]: ${e.title}`)
+        .slice(0, 40)
+        .join("\n")
+    : "";
+
+  const systemPrompt = [
+    "You check whether a backlog item currently marked BLOCKED can now be executed by an autonomous coding agent.",
+    "Return actionable=true ONLY if the blocker appears resolved (e.g. a prerequisite epic/task is now done, or the code/git state shows the dependency is ready).",
+    "Return actionable=false if the item still depends on an unfinished/blocked task, missing credentials/secrets, external manual action, or an unresolved blocker.",
+    'Respond strictly with a single JSON object: {"actionable":true|false,"reason":"short explanation in Russian"}.',
+  ].join("\n");
+
+  const userParts = [
+    epic ? `Epic: ${epic.id ?? ""} [${epic.status ?? ""}] — ${epic.title ?? ""}` : null,
+    epic?.goal ? `Epic Goal:\n${tailText(epic.goal, 1500)}` : null,
+    epic?.dod ? `Definition of Done:\n${tailText(epic.dod, 1500)}` : null,
+    task ? `Task: ${task.id ?? ""} [${task.status ?? ""}] — ${task.title ?? ""}` : null,
+    Array.isArray(task?.subitems) && task.subitems.length > 0
+      ? `Subitems:\n${task.subitems.map((s) => `- ${s}`).join("\n")}`
+      : null,
+    epicsSummary ? `All epics status:\n${epicsSummary}` : null,
+    ctx?.gitStatus ? `Git status:\n${tailText(String(ctx.gitStatus), 1500)}` : null,
+    ctx?.gitLog ? `Recent git log:\n${tailText(String(ctx.gitLog), 1500)}` : null,
+  ].filter(Boolean);
+
+  const messages = [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userParts.join("\n\n") },
+  ];
+
+  const sendRequest = (withResponseFormat) => {
+    const body = {
+      model,
+      messages,
+      temperature: 0,
+      max_tokens: 1000,
+    };
+    if (withResponseFormat) {
+      body.response_format = { type: "json_object" };
+    }
+    return postAndParseJson(url, headers, body, fetchFn, options);
+  };
+
+  let { res, data } = await sendRequest(true);
+  if (res.status === 400 || res.status === 422) {
+    await res.body?.cancel?.().catch(() => {});
+    ({ res, data } = await sendRequest(false));
+  }
+
+  if (!res.ok) {
+    const detail = await readErrorDetail(res);
+    throw new Error(`Blocked check failed (HTTP ${res.status}): ${detail}`);
+  }
+
+  return parseBlockedCheckResponse(data?.choices?.[0]?.message?.content);
 }

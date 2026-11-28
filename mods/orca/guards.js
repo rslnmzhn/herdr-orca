@@ -16,3 +16,13 @@ export function resolveCompletedCiAction(ciState) {
 export function shouldRunAutoCompact(autoCompact, hasNextItem) {
   return Boolean(autoCompact) && Boolean(hasNextItem);
 }
+
+export function shouldAutoResumePaused(autoResumeMode, agentStatus) {
+  if (autoResumeMode === "blocked") {
+    return agentStatus === "working" || agentStatus === "done";
+  }
+  if (autoResumeMode === "needs_user") {
+    return agentStatus === "working";
+  }
+  return false;
+}
